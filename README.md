@@ -44,7 +44,7 @@ this repo) will keep appending to `weekly_snapshots.csv` in whatever
 
 1. Fork or use this repo as a template.
 2. GitHub Actions should just work once you push - it's scheduled for
-   Sunday 22:00 UTC, with a manual "Run workflow" button too (Actions tab →
+   Wednesday 04:00 UTC or 2pm AEST (or 3pm during daylight savings), with a manual "Run workflow" button too (Actions tab →
    "Weekly NINDSS data update" → "Run workflow").
 3. Make sure Actions has write permission: **Settings → Actions → General →
    Workflow permissions → "Read and write permissions"** (this is required

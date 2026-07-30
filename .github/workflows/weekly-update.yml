@@ -2,10 +2,8 @@ name: Weekly NINDSS data update
 
 on:
   schedule:
-    # 22:00 UTC every Sunday = 8am Monday AEST / 9am AEDT (Australia has no
-    # single national timezone/DST, so this is approximate - close enough
-    # for a weekly cadence). Adjust to taste.
-    - cron: "0 22 * * 0"
+    # 04:00 UTC every Wednesday = 2:00pm AEST weekly
+    - cron: "0 4 * * 3"
   workflow_dispatch: {}  # lets you trigger a run manually from the Actions tab
 
 permissions:
