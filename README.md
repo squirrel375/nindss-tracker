@@ -10,15 +10,16 @@ or pull this repo, or browse the CSVs directly on GitHub.
 
 ## Data files
 
-All data lives in [`data/`](./data) and is updated weekly by
+Data and CSV history live in [`data/`](./data), charts live in
+[`graphs/`](./graphs), both updated weekly by
 [`.github/workflows/weekly-update.yml`](./.github/workflows/weekly-update.yml):
 
 | File | What it is |
 |---|---|
-| `weekly_snapshots.csv` | One row per disease per run: the run date and that year's cumulative notification count at the time. This is the source of truth for "new cases this week" (see below). |
-| `annual_totals.csv` | Full-history annual totals per disease (confirmed + probable notifications, summed across all states/territories). Overwritten each run. |
-| `weekly_new_cases.png` | Chart of new notifications since the previous run, per disease. |
-| `annual_totals.png` | Chart of annual totals per disease, all years. |
+| `data/weekly_snapshots.csv` | One row per disease per state per run: the run date and that year's cumulative notification count at the time. This is the source of truth for "new cases this week" (see below). |
+| `data/annual_totals.csv` | Full-history annual totals per disease per state (confirmed + probable notifications). Overwritten each run. |
+| `graphs/weekly_new_cases_national.png` | Chart of new notifications since the previous run, per disease, national. |
+| `graphs/weekly_new_cases_by_state.png` | Same, broken out per state/territory. |
 
 ### How "new cases this week" is calculated
 
@@ -33,7 +34,7 @@ a gap.
 
 ```bash
 pip install -r requirements.txt
-python nindss_tracker.py --data-dir data
+python nindss_tracker.py --data-dir data --graphs-dir graphs
 ```
 
 Re-running it repeatedly (e.g. via your own cron job instead of forking

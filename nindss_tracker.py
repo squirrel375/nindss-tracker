@@ -33,14 +33,17 @@ have appeared since then. Weekly is just the cadence you choose to run
 the script at (e.g. via cron) - see the bottom of this file for scheduling
 notes.
 
-OUTPUT FILES (created in --data-dir, default "./data"):
-  - annual_totals.csv     Full-history annual totals per disease (overwritten
-                           every run - just a convenience export).
-  - weekly_snapshots.csv  Cumulative-count snapshot per disease per run
+OUTPUT FILES:
+  In --data-dir (default "./data"):
+  - annual_totals.csv     Full-history annual totals per disease per state
+                           (overwritten every run - a convenience export).
+  - weekly_snapshots.csv  Cumulative-count snapshot per disease/state/run
                            (appended every run - this is the source of truth
                            for the "new cases" numbers).
-  - weekly_new_cases.png  Line chart of new cases per run/week per disease.
-  - annual_totals.png     Bar chart of annual totals per disease.
+
+  In --graphs-dir (default "./graphs"):
+  - weekly_new_cases_national.png   Line chart of new cases per week, national.
+  - weekly_new_cases_by_state.png   Same, broken out per state/territory.
 
 CAVEATS
 -------
@@ -630,65 +633,6 @@ def plot_weekly_new_cases_by_state(results, out_path, states):
     plt.close(fig)
 
 
-def plot_annual_totals(year_totals_by_disease, out_path, title_suffix="National"):
-    """Single chart of annual totals per disease for one state/National."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for disease, year_totals in year_totals_by_disease.items():
-        years = sorted(year_totals)
-        counts = [year_totals[y] for y in years]
-        ax.plot(years, counts, marker="o", label=disease)
-
-    ax.set_xlabel("Year")
-    ax.set_ylabel("Total notifications (confirmed + probable)")
-    ax.set_title(f"Annual notification totals by disease - {title_suffix}")
-    ax.set_yscale("log")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-def plot_annual_totals_by_state(all_state_totals, out_path, states):
-    """
-    Grid of small annual-totals charts, one subplot per state.
-    all_state_totals: {disease: {year: {state: total}}}
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    diseases = sorted(all_state_totals)
-    ncols = 4
-    nrows = (len(states) + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
-
-    for i, state in enumerate(states):
-        ax = axes[i // ncols][i % ncols]
-        for disease in diseases:
-            year_totals = all_state_totals[disease]
-            years = sorted(year_totals)
-            counts = [year_totals[y].get(state, 0) for y in years]
-            ax.plot(years, counts, marker="o", markersize=2, label=disease)
-        ax.set_yscale("log")
-        ax.set_title(state, fontsize=11)
-        ax.tick_params(axis="x", labelrotation=45, labelsize=7)
-
-    for i in range(len(states), nrows * ncols):
-        axes[i // ncols][i % ncols].axis("off")
-
-    handles, labels = axes[0][0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, loc="lower center", ncol=len(diseases), bbox_to_anchor=(0.5, -0.02))
-    fig.suptitle("Annual notification totals by state/territory", fontsize=14)
-    fig.tight_layout(rect=(0, 0.04, 1, 0.97))
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -697,17 +641,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--data-dir", default="data",
-        help="Directory to store CSV history and PNG charts (default: ./data)",
+        help="Directory to store CSV history (default: ./data)",
+    )
+    parser.add_argument(
+        "--graphs-dir", default="graphs",
+        help="Directory to store PNG charts, separate from --data-dir (default: ./graphs)",
     )
     args = parser.parse_args()
 
     os.makedirs(args.data_dir, exist_ok=True)
+    os.makedirs(args.graphs_dir, exist_ok=True)
     annual_csv = os.path.join(args.data_dir, "annual_totals.csv")
     weekly_csv = os.path.join(args.data_dir, "weekly_snapshots.csv")
-    weekly_national_png = os.path.join(args.data_dir, "weekly_new_cases_national.png")
-    weekly_by_state_png = os.path.join(args.data_dir, "weekly_new_cases_by_state.png")
-    annual_national_png = os.path.join(args.data_dir, "annual_totals_national.png")
-    annual_by_state_png = os.path.join(args.data_dir, "annual_totals_by_state.png")
+    weekly_national_png = os.path.join(args.graphs_dir, "weekly_new_cases_national.png")
+    weekly_by_state_png = os.path.join(args.graphs_dir, "weekly_new_cases_by_state.png")
 
     run_date = dt.date.today().isoformat()
     current_year = str(dt.date.today().year)
@@ -772,19 +719,12 @@ def main():
         for r in anomalies_this_run:
             print(f"  {r['disease']} / {r['state']} {r['year']}: now {r['cumulative']} (was higher last run)")
 
-    national_year_totals = {
-        disease: national_totals_from_state_totals(year_state_totals)
-        for disease, year_state_totals in all_state_totals.items()
-    }
-
     plot_weekly_new_cases(results, weekly_national_png, state="National")
     plot_weekly_new_cases_by_state(results, weekly_by_state_png, states)
-    plot_annual_totals(national_year_totals, annual_national_png, title_suffix="National")
-    plot_annual_totals_by_state(all_state_totals, annual_by_state_png, states)
 
     print(
         f"\nSaved:\n  {annual_csv}\n  {weekly_csv}\n  {weekly_national_png}\n"
-        f"  {weekly_by_state_png}\n  {annual_national_png}\n  {annual_by_state_png}"
+        f"  {weekly_by_state_png}"
     )
 
 
@@ -800,8 +740,8 @@ if __name__ == "__main__":
 # SCHEDULING NOTES
 # ---------------------------------------------------------------------------
 # macOS/Linux (cron), run every Monday at 9am:
-#   0 9 * * 1 /usr/bin/python3 /full/path/to/nindss_tracker.py --data-dir /full/path/to/data >> /full/path/to/data/log.txt 2>&1
+#   0 9 * * 1 /usr/bin/python3 /full/path/to/nindss_tracker.py --data-dir /full/path/to/data --graphs-dir /full/path/to/graphs >> /full/path/to/data/log.txt 2>&1
 #
 # Windows: use Task Scheduler to run weekly:
-#   python.exe C:\path\to\nindss_tracker.py --data-dir C:\path\to\data
+#   python.exe C:\path\to\nindss_tracker.py --data-dir C:\path\to\data --graphs-dir C:\path\to\graphs
 # ---------------------------------------------------------------------------
