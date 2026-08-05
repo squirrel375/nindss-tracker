@@ -68,7 +68,16 @@ import sys
 import time
 import uuid
 
-import requests
+# curl_cffi, not the plain `requests` library: identical HTTP headers were
+# confirmed (via a real browser's HAR capture) to NOT be enough to avoid a
+# 403 here as of Aug 2026 - the remaining difference is TLS fingerprint
+# (JA3/JA4) and HTTP/2 handshake behaviour, which `requests`' stock TLS
+# stack can't replicate no matter what headers you set. curl_cffi wraps
+# curl-impersonate to send an actual Chrome-shaped TLS ClientHello. Its
+# .get()/.post()/.raise_for_status() API matches `requests` closely enough
+# to be a near drop-in swap. If dashboard requests start failing again,
+# suspect this same TLS-fingerprinting layer before anything else.
+from curl_cffi import requests
 
 # ---------------------------------------------------------------------------
 # Configuration - update these if the dashboard changes (see CAVEATS above)
@@ -97,8 +106,26 @@ COMMON_HEADERS = {
     "referer": "https://app.powerbi.com/",
     "user-agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
     ),
+    # As of Aug 2026 the dashboard started returning 403 Forbidden without
+    # these. They're headers a real browser sends automatically that the
+    # `requests` library never adds on its own - Microsoft's edge/WAF layer
+    # for Power BI appears to now check for them as a basic bot-detection
+    # signal. If this script starts failing again, re-capture a HAR (see
+    # CAVEATS above) and diff its headers against this list first, since
+    # that's the most likely thing to have changed again.
+    "cache-control": "no-cache",
+    "pragma": "no-cache",
+    "dnt": "1",
+    "sec-gpc": "1",
+    "priority": "u=1, i",
+    "sec-ch-ua": '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "cross-site",
 }
 
 REQUEST_TIMEOUT = 30
@@ -114,7 +141,10 @@ def bootstrap_session():
     headers["activityid"] = str(uuid.uuid4())
     headers["requestid"] = str(uuid.uuid4())
 
-    resp = requests.get(MODELS_URL, headers=headers, timeout=REQUEST_TIMEOUT)
+    resp = requests.get(MODELS_URL, headers=headers, timeout=REQUEST_TIMEOUT, impersonate="chrome")
+    if not resp.ok:
+        print(f"  [debug] HTTP {resp.status_code} response headers: {dict(resp.headers)}", file=sys.stderr)
+        print(f"  [debug] response body (first 500 chars): {resp.text[:500]}", file=sys.stderr)
     resp.raise_for_status()
     data = resp.json()
 
@@ -371,8 +401,12 @@ def fetch_disease_year_state_totals(session_info, disease_name, report_id, max_r
     for attempt in range(1, max_retries + 1):
         try:
             resp = requests.post(
-                session_info["query_url"], headers=headers, json=body, timeout=REQUEST_TIMEOUT
+                session_info["query_url"], headers=headers, json=body,
+                timeout=REQUEST_TIMEOUT, impersonate="chrome",
             )
+            if not resp.ok:
+                print(f"  [debug] HTTP {resp.status_code} response headers: {dict(resp.headers)}", file=sys.stderr)
+                print(f"  [debug] response body (first 500 chars): {resp.text[:500]}", file=sys.stderr)
             resp.raise_for_status()
             data = resp.json()
             dsr = data["results"][0]["result"]["data"]["dsr"]
@@ -500,19 +534,16 @@ def compute_new_cases(snapshot_rows):
 # Step 4: plotting
 # ---------------------------------------------------------------------------
 
-def _plot_new_cases_on_ax(ax, results, state, diseases):
-    """Draw the weekly-new-cases lines for one state onto one axis."""
+def _plot_new_cases_on_ax(ax, results, state, diseases, year=None):
+    """Draw the weekly-new-cases lines for one state onto one axis.
+    If year is given (e.g. '2025'), only that calendar year is plotted."""
     import matplotlib.dates as mdates
 
-    this_year = dt.date.today().year
-    relevant_years = {str(this_year), str(this_year - 1)}
-    chartable = [
-        r for r in results
-        if r["state"] == state and r["year"] in relevant_years
-    ]
+    chartable = [r for r in results if r["state"] == state and (year is None or r["year"] == year)]
 
     any_plotted = False
     any_anomaly = False
+    all_dates = []
     for disease in diseases:
         points = [r for r in chartable if r["disease"] == disease and r["new_cases"] is not None]
         points.sort(key=lambda r: (r["year"], r["run_date"]))
@@ -527,6 +558,7 @@ def _plot_new_cases_on_ax(ax, results, state, diseases):
         ys = [r["new_cases"] for r in points]
         ax.plot(xs, ys, marker="o", markersize=3, label=disease)
         any_plotted = True
+        all_dates.extend(xs)
         anomalies = [r for r in points if r["anomaly"]]
         if anomalies:
             any_anomaly = True
@@ -538,7 +570,12 @@ def _plot_new_cases_on_ax(ax, results, state, diseases):
             )
 
     if any_plotted:
-        ax.xaxis.set_major_locator(mdates.MonthLocator())
+        # Full history can span well over a year - space tick labels out
+        # further (every 2nd/3rd month) once there's enough range that
+        # monthly labels would start overlapping.
+        span_months = (max(all_dates).year - min(all_dates).year) * 12 + (max(all_dates).month - min(all_dates).month)
+        interval = 1 if span_months <= 14 else (2 if span_months <= 26 else 3)
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=interval))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
     else:
         ax.text(
@@ -549,20 +586,22 @@ def _plot_new_cases_on_ax(ax, results, state, diseases):
     return any_plotted, any_anomaly
 
 
-def plot_weekly_new_cases(results, out_path, state="National"):
-    """Single chart of weekly new cases for one state (default: National)."""
+def plot_weekly_new_cases(results, out_path, state="National", year=None):
+    """Single chart of weekly new cases for one state (default: National).
+    If year is given, only that calendar year is shown."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     diseases = sorted(set(r["disease"] for r in results if r["state"] == state))
     fig, ax = plt.subplots(figsize=(10, 6.5))
-    any_plotted, any_anomaly = _plot_new_cases_on_ax(ax, results, state, diseases)
+    any_plotted, any_anomaly = _plot_new_cases_on_ax(ax, results, state, diseases, year=year)
 
+    title_suffix = f" - {year}" if year else ""
     if any_plotted:
         ax.set_xlabel("Month")
         ax.set_ylabel("New notifications since previous run")
-        ax.set_title(f"Weekly new case numbers - {state} (confirmed + probable)")
+        ax.set_title(f"Weekly new case numbers - {state} (confirmed + probable){title_suffix}")
         handles, labels = ax.get_legend_handles_labels()
         if any_anomaly:
             marker = plt.Line2D(
@@ -581,15 +620,16 @@ def plot_weekly_new_cases(results, out_path, state="National"):
         fig.autofmt_xdate(rotation=45)
         fig.tight_layout(rect=(0, 0.13, 1, 1))
     else:
-        ax.set_title(f"Weekly new case numbers - {state}")
+        ax.set_title(f"Weekly new case numbers - {state}{title_suffix}")
         fig.tight_layout()
 
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_weekly_new_cases_by_state(results, out_path, states):
-    """Grid of small weekly-new-cases charts, one subplot per state."""
+def plot_weekly_new_cases_by_state(results, out_path, states, year=None):
+    """Grid of small weekly-new-cases charts, one subplot per state.
+    If year is given, only that calendar year is shown."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -602,7 +642,7 @@ def plot_weekly_new_cases_by_state(results, out_path, states):
     any_anomaly_overall = False
     for i, state in enumerate(states):
         ax = axes[i // ncols][i % ncols]
-        _, any_anomaly = _plot_new_cases_on_ax(ax, results, state, diseases)
+        _, any_anomaly = _plot_new_cases_on_ax(ax, results, state, diseases, year=year)
         any_anomaly_overall = any_anomaly_overall or any_anomaly
         ax.set_title(state, fontsize=11)
         ax.tick_params(axis="x", labelrotation=45, labelsize=7)
@@ -627,7 +667,8 @@ def plot_weekly_new_cases_by_state(results, out_path, states):
             handles, labels, loc="lower center", ncol=2,
             bbox_to_anchor=(0.5, 0.0), fontsize=10, frameon=True,
         )
-    fig.suptitle("Weekly new case numbers by state/territory", fontsize=14)
+    title_suffix = f" - {year}" if year else ""
+    fig.suptitle(f"Weekly new case numbers by state/territory{title_suffix}", fontsize=14)
     fig.tight_layout(rect=(0, 0.09, 1, 0.96))
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -722,9 +763,18 @@ def main():
     plot_weekly_new_cases(results, weekly_national_png, state="National")
     plot_weekly_new_cases_by_state(results, weekly_by_state_png, states)
 
+    years_present = sorted(set(r["year"] for r in results if r["new_cases"] is not None))
+    year_files = []
+    for year in years_present:
+        national_year_png = os.path.join(args.graphs_dir, f"weekly_new_cases_national_{year}.png")
+        by_state_year_png = os.path.join(args.graphs_dir, f"weekly_new_cases_by_state_{year}.png")
+        plot_weekly_new_cases(results, national_year_png, state="National", year=year)
+        plot_weekly_new_cases_by_state(results, by_state_year_png, states, year=year)
+        year_files += [national_year_png, by_state_year_png]
+
     print(
         f"\nSaved:\n  {annual_csv}\n  {weekly_csv}\n  {weekly_national_png}\n"
-        f"  {weekly_by_state_png}"
+        f"  {weekly_by_state_png}\n  " + "\n  ".join(year_files)
     )
 
 
