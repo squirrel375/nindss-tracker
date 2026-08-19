@@ -28,18 +28,37 @@ Both PNG and HTML versions also come in per-year variants, e.g.
 ### How "new cases this week" is calculated
 
 The dashboard itself only exposes cumulative annual totals, not a weekly
-breakdown. So each week this tool takes a snapshot of the current year's
-running total per disease, and the "new cases" number is just this week's
-snapshot minus last week's snapshot for the same disease and year. It's
-exact - not an estimate - as long as the workflow runs every week without
-a gap.
+breakdown. So each week this tool takes a snapshot of every year's running
+total per disease/state (not just the current year - that also catches
+late-reported/backdated corrections), and the "new cases" number is just
+this week's snapshot minus last week's snapshot for the same disease,
+state, and year. It's exact - not an estimate - as long as the workflow
+runs every week without a gap.
+
+If a run is missed, a skipped week or two just means the next delta covers
+a slightly longer period - still a real number. But if a disease/state/year
+combination goes more than 45 days without a snapshot (e.g. the workflow
+breaks for over a month, or - as happened before this tool tracked every
+year each week - a year simply wasn't being checked yet), that gap is
+treated as a fresh start rather than reported as one artificially huge
+"new cases" figure covering the whole gap.
+
+Occasionally the source data itself is revised **downward** (health.gov.au
+correcting an earlier count) - these show up as red-ringed points on the
+charts rather than a negative "new cases" number.
 
 ## Running it yourself
 
 ```bash
 pip install -r requirements.txt
+playwright install chromium
 python nindss_tracker.py --data-dir data --graphs-dir graphs
 ```
+
+`playwright install chromium` is a one-time step that downloads an actual
+Chromium binary - the `playwright` pip package alone isn't enough to run
+it, since the fetch itself runs inside a real headless browser (see
+"How it works" below).
 
 Re-running it repeatedly (e.g. via your own cron job instead of forking
 this repo) will keep appending to `weekly_snapshots.csv` in whatever
@@ -57,10 +76,17 @@ this repo) will keep appending to `weekly_snapshots.csv` in whatever
 
 ## How it works, and its limitations
 
-The NINDSS dashboard is a Power BI report with no published API - this
-script talks to the same internal Microsoft endpoints the dashboard's own
-web page uses, decodes Power BI's compact response format, and extracts
-national confirmed + probable notification counts.
+The NINDSS dashboard is a Power BI report with no published API. The
+underlying endpoints are behind bot-protection that blocks plain HTTP
+clients even when their headers and TLS fingerprint are made to match a
+real browser exactly - so instead of imitating a browser, this script
+drives an actual one: it loads the real dashboard page with Playwright,
+finds the Power BI iframe the page embeds, and runs the same `fetch()`
+calls a real session would from inside that iframe's own JS context. That
+gives it the real session's cookies, bearer token, and whatever
+bot-challenge state the page picked up - rather than trying to fake any of
+it. It then decodes Power BI's compact response format ("DSR") to extract
+confirmed + probable notification counts per disease/state/year.
 
 This is inherently fragile: it's an undocumented API that could change
 without notice. If a scheduled run fails, the workflow automatically opens

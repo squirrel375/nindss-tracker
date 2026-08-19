@@ -81,8 +81,10 @@ CAVEATS
 - Needs a real Chromium binary installed (`playwright install chromium`),
   not just the `playwright` pip package - see requirements.txt / README.
 - "New cases this week" is only as good as your run cadence - if you skip a
-  week, the delta just covers a longer period; the script does not try to
-  guess actual daily case dates.
+  week or two, the delta just covers a longer period; the script does not
+  try to guess actual daily case dates. But a gap over MAX_GAP_DAYS (see
+  compute_new_cases) is treated as a fresh start rather than one
+  artificially huge "new cases" figure covering the whole gap.
 - Counts include both "Confirmed" and "Probable" notifications, matching what
   the public dashboard displays.
 """
