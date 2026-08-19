@@ -108,6 +108,22 @@ DISEASE_NAMES = {
     "Measles": "Measles",
 }
 
+# Fixed per-disease plot colour, so e.g. COVID-19 is always the same colour
+# on every graph. Without this, matplotlib's default colour cycling assigns
+# colours in whatever order diseases are plotted on THAT axis - if one
+# subplot happens to have no data for a disease (skipping it, never calling
+# ax.plot() for it), every disease after it silently shifts into the next
+# colour along, so the same disease ends up a different colour on different
+# graphs. Red is deliberately not used here - it's reserved for circling
+# anomalies (see _plot_new_cases_on_ax) regardless of which disease line
+# they land on.
+DISEASE_COLORS = {
+    "COVID-19": "#1f77b4",
+    "Influenza": "#ff7f0e",
+    "RSV": "#2ca02c",
+    "Measles": "#9467bd",
+}
+
 # Only application-level headers - NOT browser-fingerprint headers
 # (User-Agent, Origin, Referer, Sec-*, Accept-Encoding, etc). Those used to
 # be spoofed by hand here, but a real browser (via Playwright) sets all of
@@ -742,6 +758,13 @@ def compute_new_cases(snapshot_rows):
     revising a count downward) within the same year - those are flagged as
     anomalies rather than silently reported as a negative "new case" count.
 
+    Also new_cases=None (a reset, same as a first sighting) whenever the gap
+    since that year's previous snapshot exceeds MAX_GAP_DAYS - a multi-month
+    gap means that year genuinely wasn't tracked at all for a while, not
+    "you missed a week or two," and reporting however much it grew over the
+    whole gap as a single week's "new cases" would be fabricating a number,
+    not just reporting a slightly-longer-than-usual one.
+
     Rows from before the 'state' column existed are treated as state="National"
     for backwards compatibility with older weekly_snapshots.csv files.
     """
@@ -750,6 +773,19 @@ def compute_new_cases(snapshot_rows):
         state = row.get("state") or "National"
         key = (row["disease"], state)
         by_group.setdefault(key, []).append(row)
+
+    # Beyond this, a gap between consecutive snapshots for the same
+    # disease+state+year isn't "you skipped a week or two" (the CAVEATS at
+    # the top of this file already account for that - the delta just covers
+    # a longer period, which is fine) - it's evidence that year simply
+    # wasn't being tracked at all for a long stretch (e.g. an older version
+    # of this script only ever recorded the *current* year each week, so an
+    # older year's tracking silently stopped the moment the year rolled
+    # over, until multi-year fetching resumed much later). Treat that like
+    # a fresh first sighting (new_cases=None) rather than reporting however
+    # many months of accumulated growth happened to fall between the two
+    # snapshots as if it were one week's worth of new cases.
+    MAX_GAP_DAYS = 45
 
     results = []
     for (disease, state), rows in by_group.items():
@@ -766,9 +802,17 @@ def compute_new_cases(snapshot_rows):
             if prev is None:
                 new_cases = None
             else:
-                new_cases = cumulative - prev
-                if new_cases < 0:
-                    anomaly = True
+                prev_cumulative, prev_run_date = prev
+                gap_days = (
+                    dt.datetime.strptime(row["run_date"], "%Y-%m-%d")
+                    - dt.datetime.strptime(prev_run_date, "%Y-%m-%d")
+                ).days
+                if gap_days > MAX_GAP_DAYS:
+                    new_cases = None
+                else:
+                    new_cases = cumulative - prev_cumulative
+                    if new_cases < 0:
+                        anomaly = True
             results.append(
                 {
                     "run_date": row["run_date"],
@@ -780,7 +824,7 @@ def compute_new_cases(snapshot_rows):
                     "anomaly": anomaly,
                 }
             )
-            prev_by_year[year] = cumulative
+            prev_by_year[year] = (cumulative, row["run_date"])
     return results
 
 
@@ -821,7 +865,29 @@ def _plot_new_cases_on_ax(ax, results, state, diseases, year=None):
         # locator instead of labeling every single week.
         xs = [dt.datetime.strptime(r["run_date"], "%Y-%m-%d") for r in points]
         ys = [r["new_cases"] for r in points]
-        ax.plot(xs, ys, marker="o", markersize=3, label=disease)
+        color = DISEASE_COLORS.get(disease)
+
+        # Break the line wherever consecutive points are separated by an
+        # unusually long gap - e.g. a year's tracking stopped for months
+        # (older versions of this script only recorded the *current* year
+        # each week) before multi-year fetching resumed and picked up one
+        # genuine but isolated late-arriving point. A straight line across
+        # that gap would visually claim a smooth trend that never actually
+        # happened, so each gap-separated run of points is plotted as its
+        # own segment instead - isolated points then show as disconnected
+        # markers rather than the ends of a long diagonal line.
+        GAP_BREAK_DAYS = 21
+        segments = [[]]
+        for x, y in zip(xs, ys):
+            if segments[-1] and (x - segments[-1][-1][0]).days > GAP_BREAK_DAYS:
+                segments.append([])
+            segments[-1].append((x, y))
+        for seg_i, seg in enumerate(segments):
+            ax.plot(
+                [p[0] for p in seg], [p[1] for p in seg],
+                marker="o", markersize=3, color=color,
+                label=disease if seg_i == 0 else None,
+            )
         any_plotted = True
         all_dates.extend(xs)
         anomalies = [r for r in points if r["anomaly"]]
