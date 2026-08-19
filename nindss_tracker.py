@@ -21,9 +21,24 @@ browser talks to two Microsoft services to get data:
      actual DAX-ish query and returns data in Power BI's compact "DSR"
      format (values are run-length encoded).
 
-This script replicates both calls using the `requests` library, decodes the
-DSR response, and extracts national (all states/territories) confirmed +
-probable notification counts per disease per calendar year.
+As of Aug 2026, these endpoints are behind bot-protection that survived
+three separate, well-targeted fix attempts using plain HTTP clients:
+matching the browser's exact headers, matching its TLS fingerprint
+(curl_cffi/curl-impersonate), and matching its exact call sequence over a
+persistent connection - all produced the identical empty-body 403. That
+pattern (fails even on the very first request, before any session state
+could matter) means the block is almost certainly a JavaScript-computed
+challenge invisible to a HAR capture - something no amount of replicating
+*observed* request shape can solve, because the thing producing a valid
+request is code we can't see running.
+
+So this script drives an actual, real headless Chromium browser via
+Playwright instead of impersonating one: it loads the real dashboard page,
+finds the Power BI iframe Microsoft's embed renders into, and runs the same
+fetch() calls a real session would - from inside that real browser's JS
+engine. This isn't an impersonation technique, it doesn't need to be - it
+IS a browser, so whatever the challenge mechanism actually is gets solved
+the same way it would for a person visiting the page.
 
 Because the dashboard does not expose a daily/weekly breakdown directly, we
 get "new cases this week" by keeping our own running history: each time you
@@ -44,14 +59,21 @@ OUTPUT FILES:
   In --graphs-dir (default "./graphs"):
   - weekly_new_cases_national.png   Line chart of new cases per week, national.
   - weekly_new_cases_by_state.png   Same, broken out per state/territory.
+  - weekly_new_cases_national_<year>.png / _by_state_<year>.png
+                                     Same two charts, one pair per calendar year.
 
 CAVEATS
 -------
 - This relies on an undocumented, internal Power BI API that Microsoft/health.gov.au
   could change at any time without notice. If it stops working, re-capture a
-  HAR file from https://nindss.health.gov.au/pbi-dashboard/ and update
-  REPORT_ID below (and check DISEASE_NAMES still match what's in the "Where"
-  filters of the QueryExecutionService requests).
+  HAR file from https://nindss.health.gov.au/pbi-dashboard/ (Chrome DevTools
+  -> Network tab -> Preserve log -> reload -> "Save all as HAR with content")
+  and check: (a) REPORT_ID below still matches, (b) DISEASE_NAMES still match
+  the "Where" filters of the QueryExecutionService requests, (c) whether the
+  Power BI iframe's URL/structure changed in a way find_powerbi_frame() needs
+  to account for.
+- Needs a real Chromium binary installed (`playwright install chromium`),
+  not just the `playwright` pip package - see requirements.txt / README.
 - "New cases this week" is only as good as your run cadence - if you skip a
   week, the delta just covers a longer period; the script does not try to
   guess actual daily case dates.
@@ -68,28 +90,15 @@ import sys
 import time
 import uuid
 
-# curl_cffi, not the plain `requests` library: identical HTTP headers were
-# confirmed (via a real browser's HAR capture) to NOT be enough to avoid a
-# 403 here as of Aug 2026 - the remaining difference is TLS fingerprint
-# (JA3/JA4) and HTTP/2 handshake behaviour, which `requests`' stock TLS
-# stack can't replicate no matter what headers you set. curl_cffi wraps
-# curl-impersonate to send an actual Chrome-shaped TLS ClientHello. Its
-# .get()/.post()/.raise_for_status() API matches `requests` closely enough
-# to be a near drop-in swap. If dashboard requests start failing again,
-# suspect this same TLS-fingerprinting layer before anything else.
-from curl_cffi import requests
+from playwright.sync_api import sync_playwright
 
 # ---------------------------------------------------------------------------
 # Configuration - update these if the dashboard changes (see CAVEATS above)
 # ---------------------------------------------------------------------------
 
-REPORT_ID = "bc027587-5e9e-4920-bf03-a45fd3079f25"
+DASHBOARD_URL = "https://nindss.health.gov.au/pbi-dashboard/"
 
-MODELS_URL = (
-    f"https://wabi-australia-southeast-redirect.analysis.windows.net/explore/"
-    f"reports/{REPORT_ID}/modelsAndExploration"
-    f"?preferReadOnlySession=true&skipQueryData=true"
-)
+REPORT_ID = "bc027587-5e9e-4920-bf03-a45fd3079f25"
 
 # Exact "DISEASE NAME" values as used by the dashboard's own filters.
 DISEASE_NAMES = {
@@ -99,54 +108,196 @@ DISEASE_NAMES = {
     "Measles": "Measles",
 }
 
-COMMON_HEADERS = {
+# Only application-level headers - NOT browser-fingerprint headers
+# (User-Agent, Origin, Referer, Sec-*, Accept-Encoding, etc). Those used to
+# be spoofed by hand here, but a real browser (via Playwright) sets all of
+# that automatically and correctly - and 'Origin' specifically is a
+# "forbidden header name" that JS fetch() won't even let us override, so
+# there's no point trying. Less to keep in sync with future HAR captures.
+APP_HEADERS = {
     "accept": "application/json, text/plain, */*",
-    "accept-language": "en-US,en;q=0.9",
-    "origin": "https://app.powerbi.com",
-    "referer": "https://app.powerbi.com/",
-    "user-agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
-    ),
-    # As of Aug 2026 the dashboard started returning 403 Forbidden without
-    # these. They're headers a real browser sends automatically that the
-    # `requests` library never adds on its own - Microsoft's edge/WAF layer
-    # for Power BI appears to now check for them as a basic bot-detection
-    # signal. If this script starts failing again, re-capture a HAR (see
-    # CAVEATS above) and diff its headers against this list first, since
-    # that's the most likely thing to have changed again.
-    "cache-control": "no-cache",
-    "pragma": "no-cache",
-    "dnt": "1",
-    "sec-gpc": "1",
-    "priority": "u=1, i",
-    "sec-ch-ua": '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "cross-site",
+    "x-powerbi-hostenv": "Embed for Customers",
 }
 
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT_MS = 30000
+PAGE_LOAD_TIMEOUT_MS = 90000
+# Confirmed via a real run (Aug 2026): the dashboard makes 100+ requests
+# during its own natural bootstrap (large JS bundles, fonts, telemetry,
+# then finally the actual API calls) - the modelsAndExploration call
+# genuinely can take longer than networkidle + a short grace window to
+# show up. 25s wasn't enough margin and caused a false "never observed"
+# failure even though the real page loaded and worked fine (confirmed via
+# debug_screenshot.png showing live data). 60s gives real headroom.
+FRAME_WAIT_TIMEOUT_S = 60
 
 
 # ---------------------------------------------------------------------------
-# Step 1: bootstrap - find current modelId / datasetId / capacity URL
+# Step 1: bootstrap - load the real dashboard, find the Power BI frame,
+# discover the current modelId / datasetId / capacity URL
 # ---------------------------------------------------------------------------
 
-def bootstrap_session():
-    headers = dict(COMMON_HEADERS)
-    headers["x-powerbi-hostenv"] = "Embed for Customers"
-    headers["activityid"] = str(uuid.uuid4())
-    headers["requestid"] = str(uuid.uuid4())
+_FETCH_JS = """
+async ({url, method, headers, body}) => {
+    const opts = {method, headers};
+    if (body !== null && body !== undefined) { opts.body = body; }
+    const resp = await fetch(url, opts);
+    const text = await resp.text();
+    return {status: resp.status, ok: resp.ok, headers: Object.fromEntries(resp.headers.entries()), text};
+}
+"""
 
-    resp = requests.get(MODELS_URL, headers=headers, timeout=REQUEST_TIMEOUT, impersonate="chrome")
+
+def _frame_fetch(frame, url, method="GET", headers=None, body=None, compare_to_sample=None):
+    """Run a fetch() call inside a real (Playwright-controlled) browser
+    frame's own JS context, so it inherits that frame's real TLS/HTTP
+    fingerprint, cookies, and any bot-challenge state - rather than us
+    trying to fake any of that ourselves."""
+    result = frame.evaluate(_FETCH_JS, {
+        "url": url, "method": method, "headers": headers or {}, "body": body,
+    })
+    if not result["ok"]:
+        print(f"  [debug] {method} {url} -> HTTP {result['status']}", file=sys.stderr)
+        print(f"  [debug] response headers: {result['headers']}", file=sys.stderr)
+        print(f"  [debug] response body (first 500 chars): {result['text'][:500]}", file=sys.stderr)
+        if compare_to_sample and compare_to_sample.get("request"):
+            print(f"  [debug] our request headers: {headers}", file=sys.stderr)
+            print(
+                f"  [debug] headers from the page's own naturally-triggered query call "
+                f"(status {compare_to_sample.get('status')} to {compare_to_sample.get('url')}): "
+                f"{compare_to_sample['request']}",
+                file=sys.stderr,
+            )
+            our_keys = set((headers or {}).keys())
+            their_keys = set(compare_to_sample["request"].keys())
+            missing = their_keys - our_keys
+            if missing:
+                print(f"  [debug] headers the real call sends that ours doesn't: {sorted(missing)}", file=sys.stderr)
+        else:
+            print(
+                "  [debug] no naturally-triggered query call was observed during the "
+                "initial page load, so there's nothing to compare our headers against.",
+                file=sys.stderr,
+            )
+        raise RuntimeError(f"HTTP {result['status']} for {url}")
+    return result["text"]
+
+
+def find_powerbi_frame(page):
+    """The dashboard page embeds the actual Power BI report in an iframe on
+    app.powerbi.com - that's the frame whose JS context has the real,
+    trusted browser session later per-disease query calls need to run
+    inside. Iframe load can lag behind the main page's load event, so poll
+    for it."""
+    deadline = time.time() + FRAME_WAIT_TIMEOUT_S
+    while time.time() < deadline:
+        for frame in page.frames:
+            if "powerbi.com" in frame.url:
+                try:
+                    frame.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:  # noqa: BLE001 - fall through to retry loop
+                    pass
+                return frame
+        time.sleep(0.5)
+    raise RuntimeError(
+        "Couldn't find a powerbi.com iframe on the dashboard page within "
+        f"{FRAME_WAIT_TIMEOUT_S}s. The page structure may have changed - "
+        "re-capture a HAR and check what frame/iframe the report now loads "
+        "into. See CAVEATS at the top of this script."
+    )
+
+
+def bootstrap_session(playwright):
+    # Even a genuine headless-Chromium fetch() call, injected immediately
+    # after navigation, still got 403'd (confirmed Aug 2026) - identically
+    # to every plain-HTTP attempt before it. That rules fingerprinting out
+    # entirely (this IS a real browser) and points at something more subtle:
+    # racing the page's OWN natural bootstrap sequence with a duplicate call
+    # before whatever establishes trust has finished. So instead of firing
+    # our own conceptualschema/modelsAndExploration requests, we let the
+    # real page trigger those calls itself and read the real response it
+    # already got - zero racing, zero duplication, pure observation.
+    #
+    # A hand-rolled page.on("response", ...) listener + polling loop was
+    # tried first and consistently failed to notice a response that clearly
+    # DID happen (confirmed via the full request-log dump and a screenshot
+    # showing the fully-rendered dashboard) - the likely cause is a known
+    # sharp edge in Playwright's sync API: event callbacks run on its
+    # internal driver thread, and holding onto / re-touching that Response
+    # object later from the main thread is a documented source of exactly
+    # this kind of silent, hard-to-reproduce miss. expect_response() is
+    # Playwright's own purpose-built, tested API for "wait for a specific
+    # response triggered by this action" - it avoids that whole class of
+    # problem rather than working around it by hand.
+    all_requests_seen = []  # every request URL+status the page makes - diagnostic only
+    query_sample = {}  # first naturally-triggered /query request, for header comparison if we hit auth trouble later
+    capturing_sample = [True]  # mutable so the closure below can flip it off
+
+    browser = playwright.chromium.launch(headless=True)
+    page = browser.new_page()
+
+    def on_response(r):
+        all_requests_seen.append(f"{r.status} {r.url}")
+        # Bug found the hard way: this listener stays registered on `page`
+        # for its whole lifetime, and fetch_disease_year_state_totals()
+        # reuses this same page/frame much later via _frame_fetch(). Without
+        # this guard, OUR OWN later injected query call re-triggers this
+        # same handler and gets mistaken for a "natural" sample to compare
+        # against - comparing our failing request against itself, which is
+        # useless (confirmed via a live run: the "sample" had our own exact
+        # activityid/requestid). Only ever capture during the initial load.
+        if not capturing_sample[0]:
+            return
+        if "QueryExecutionService" in r.url and "request" not in query_sample:
+            try:
+                query_sample["request"] = dict(r.request.headers)
+                query_sample["url"] = r.url
+                query_sample["status"] = r.status
+            except Exception:  # noqa: BLE001 - purely opportunistic, never let this break the real flow
+                pass
+
+    page.on("response", on_response)
+
+    try:
+        with page.expect_response(
+            lambda r: "modelsAndExploration" in r.url,
+            timeout=(PAGE_LOAD_TIMEOUT_MS + FRAME_WAIT_TIMEOUT_S * 1000),
+        ) as response_info:
+            page.goto(DASHBOARD_URL, wait_until="networkidle", timeout=PAGE_LOAD_TIMEOUT_MS)
+        resp = response_info.value
+    except Exception as exc:  # noqa: BLE001 - includes Playwright's TimeoutError
+        # Dump everything we can to actually diagnose this rather than
+        # guess again: what the browser rendered, what frames exist, and
+        # every single network request the page made. debug_screenshot.png
+        # in particular will show a captcha/consent banner/error page if
+        # that's what's actually happening, which none of the network-level
+        # signals below can reveal on their own.
+        try:
+            page.screenshot(path="debug_screenshot.png", full_page=True)
+            print("  [debug] saved debug_screenshot.png - open it to see what the browser actually rendered", file=sys.stderr)
+        except Exception as screenshot_exc:  # noqa: BLE001
+            print(f"  [debug] couldn't save screenshot: {screenshot_exc}", file=sys.stderr)
+
+        print(f"  [debug] page.url = {page.url}", file=sys.stderr)
+        print(f"  [debug] frames found ({len(page.frames)}):", file=sys.stderr)
+        for f in page.frames:
+            print(f"    - {f.url}", file=sys.stderr)
+
+        print(f"  [debug] {len(all_requests_seen)} responses observed total:", file=sys.stderr)
+        for line in all_requests_seen:
+            print(f"    - {line}", file=sys.stderr)
+
+        raise RuntimeError(
+            f"Failed waiting for the page's own modelsAndExploration call ({exc}) - "
+            "the dashboard's structure or bootstrap sequence may have changed. "
+            "See CAVEATS in this script, and the debug output above/debug_screenshot.png."
+        )
+
     if not resp.ok:
-        print(f"  [debug] HTTP {resp.status_code} response headers: {dict(resp.headers)}", file=sys.stderr)
-        print(f"  [debug] response body (first 500 chars): {resp.text[:500]}", file=sys.stderr)
-    resp.raise_for_status()
-    data = resp.json()
+        print(f"  [debug] modelsAndExploration HTTP {resp.status} (observed, not injected)", file=sys.stderr)
+        print(f"  [debug] response body (first 500 chars): {resp.text()[:500]}", file=sys.stderr)
+        raise RuntimeError(f"The dashboard's own modelsAndExploration call itself returned HTTP {resp.status}")
+
+    data = json.loads(resp.text())
 
     models = data.get("models")
     if not models:
@@ -159,20 +310,80 @@ def bootstrap_session():
     model_id = model["id"]
     dataset_id = model["dbName"]
 
-    capacity_uri = model.get("capacityUri")
+    # As of Aug 2026 this lives at the top level under "exploration", not
+    # nested inside the model object where it used to be (confirmed via a
+    # live run's [debug] dump). Checking the old location too as a fallback
+    # costs nothing and adds a little resilience if it ever moves back.
+    capacity_uri = data.get("exploration", {}).get("capacityUri") or model.get("capacityUri")
     if not capacity_uri:
+        # The response shape has evidently changed again since this script
+        # was last updated - rather than guess at a new field name, find
+        # every key anywhere in the response whose name mentions "capacity"
+        # or "uri" (recursing into nested dicts/lists) and print those
+        # paths and values, plus the top-level key structure. That should
+        # show exactly where the capacity info moved to, if it's in there
+        # at all.
+        def find_matching_paths(obj, path=""):
+            matches = []
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    new_path = f"{path}.{k}" if path else k
+                    if "capacit" in k.lower() or "uri" in k.lower():
+                        matches.append((new_path, v if not isinstance(v, (dict, list)) else type(v).__name__))
+                    matches += find_matching_paths(v, new_path)
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj[:3]):  # cap it - just need a sample
+                    matches += find_matching_paths(item, f"{path}[{i}]")
+            return matches
+
+        print(f"  [debug] model's top-level keys: {sorted(model.keys())}", file=sys.stderr)
+        print(f"  [debug] response's top-level keys: {sorted(data.keys())}", file=sys.stderr)
+        print("  [debug] keys anywhere in the response mentioning 'capacity' or 'uri':", file=sys.stderr)
+        for path, val in find_matching_paths(data):
+            print(f"    - {path} = {val}", file=sys.stderr)
+
         raise RuntimeError(
-            "Couldn't find 'capacityUri' in modelsAndExploration response."
+            "Couldn't find 'capacityUri' in modelsAndExploration response - "
+            "see the [debug] output above for where the capacity info "
+            "actually lives in the current response shape, then update "
+            "bootstrap_session() to match. See CAVEATS in this script."
         )
     # capacityUri already ends in '.../public/' - the query endpoint is
     # that plus 'query'.
     query_url = capacity_uri.rstrip("/") + "/query"
 
+    frame = find_powerbi_frame(page)
+
+    # modelsAndExploration resolving doesn't mean the report's own internal
+    # rendering pipeline has gotten around to issuing ITS query calls yet -
+    # confirmed via a live run where the sample was never captured at all,
+    # even though the report demonstrably does make these calls (seen
+    # earlier in a full request-log dump). Give it a real window to happen
+    # naturally before closing off capturing - still well before our own
+    # first injected call would fire (that only happens after this function
+    # returns AND several more statements run in the caller). on_response
+    # (registered above) does the actual capturing as a side effect of
+    # whatever happens during this wait - nothing more to do here than wait.
+    if not query_sample:
+        page.wait_for_timeout(15000)
+    capturing_sample[0] = False
+
     return {
         "model_id": model_id,
         "dataset_id": dataset_id,
         "query_url": query_url,
+        "browser": browser,
+        "page": page,
+        "frame": frame,
+        "query_sample": query_sample,
     }
+
+
+def close_session(session_info):
+    try:
+        session_info["browser"].close()
+    except Exception:  # noqa: BLE001 - best-effort cleanup, never fail the run over this
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -288,17 +499,13 @@ def _parse_dsr_number(value):
     return 0
 
 
-def _lookup_dict_value(dict_list, index):
+def _parse_quoted_literal(raw):
     """
-    Resolve one entry from a Power BI ValueDicts list, e.g. "'3,363,646'" or
-    "'<5'" (privacy-suppressed small counts, shown as '<5' on the dashboard
+    Parse a Power BI quoted value literal, e.g. "'3,363,646'" or "'<5'"
+    (privacy-suppressed small counts, shown as '<5' on the dashboard
     itself). We treat '<5' as 3 (the midpoint of 0-4) since the true value
     isn't published - this only affects a handful of very small/old rows.
     """
-    try:
-        raw = dict_list[index]
-    except (IndexError, TypeError):
-        return 0
     s = str(raw).strip()
     if s.startswith("'") and s.endswith("'"):
         s = s[1:-1]
@@ -309,6 +516,15 @@ def _lookup_dict_value(dict_list, index):
         return float(s) if "." in s else int(s)
     except ValueError:
         return 0
+
+
+def _lookup_dict_value(dict_list, index):
+    """Resolve one entry from a Power BI ValueDicts list by index."""
+    try:
+        raw = dict_list[index]
+    except (IndexError, TypeError):
+        return 0
+    return _parse_quoted_literal(raw)
 
 
 def decode_dsr_by_state(dsr):
@@ -344,13 +560,21 @@ def decode_dsr_by_state(dsr):
                 state_order = [entry.get("G1") for entry in sh[0][dm_key]]
 
         dict_name = None
+        # "R" is a run-length repeat of whatever value immediately precedes
+        # it in the flattened year-then-state sequence - which can be the
+        # last state of the *previous* year's row, not just an earlier
+        # column in the *current* row (confirmed via a live response: years
+        # with no real cases at all come back as a row of pure {"R": n}
+        # items, no M0 anywhere in that row, that must carry forward the
+        # last real value seen). So last_value persists across rows here,
+        # not reset per-row.
+        last_value = 0
         for ph_row in ds.get("PH", []):
             for row in ph_row.get("DM0", []):
                 year = row.get("G0")
                 if year is None:
                     continue
                 year_result = result.setdefault(year, {})
-                last_value = 0
                 col = 0
                 for item in row.get("X", []):
                     if "S" in item:
@@ -359,7 +583,19 @@ def decode_dsr_by_state(dsr):
                                 dict_name = s_desc["DN"]
                     if "M0" in item:
                         raw = item["M0"]
-                        if isinstance(raw, str):
+                        if isinstance(raw, str) and raw.startswith("'"):
+                            # A quoted literal like "'17,895'" or "'<5'" sent
+                            # inline rather than as a dictionary index -
+                            # confirmed via a live response: higher-
+                            # cardinality columns (e.g. Influenza, which has
+                            # far more distinct values than COVID) mix these
+                            # in with plain-int dictionary indices in the
+                            # same row once a value doesn't fit the
+                            # dictionary. _parse_dsr_number can't handle the
+                            # quotes/commas, so this needs the same parsing
+                            # ValueDicts entries get.
+                            value = _parse_quoted_literal(raw)
+                        elif isinstance(raw, str):
                             value = _parse_dsr_number(raw)
                         elif dict_name is not None and dict_name in value_dicts:
                             value = _lookup_dict_value(value_dicts[dict_name], raw)
@@ -388,10 +624,31 @@ def national_totals_from_state_totals(year_state_totals):
 
 def fetch_disease_year_state_totals(session_info, disease_name, report_id, max_retries=3):
     """Returns {year: {state: cumulative_notifications}} for one disease."""
-    headers = dict(COMMON_HEADERS)
+    headers = dict(APP_HEADERS)
     headers["content-type"] = "application/json;charset=UTF-8"
     headers["activityid"] = str(uuid.uuid4())
     headers["requestid"] = str(uuid.uuid4())
+
+    # As of Aug 2026 the query endpoint 401s ("Authentication failed for
+    # all authenticators") without a bearer token - confirmed via a live
+    # run's [debug] header diff. That token (an "MWCToken" JWT) is minted
+    # by the Power BI client JS for its own naturally-triggered query call,
+    # not something a plain fetch() can obtain or fake - so reuse it from
+    # query_sample (captured during bootstrap_session's initial page load)
+    # along with the other non-fingerprint headers the real call sent that
+    # ours didn't. It's a session-scoped credential tied to the report
+    # session, not to one specific query, so it's safe to reuse across all
+    # per-disease requests in this run.
+    sample_headers = (session_info.get("query_sample") or {}).get("request") or {}
+    for key in ("authorization", "x-ms-workload-resource-moniker", "x-ms-root-activity-id", "x-ms-parent-activity-id"):
+        if key in sample_headers:
+            headers[key] = sample_headers[key]
+    if "authorization" not in headers:
+        print(
+            "  [debug] no 'authorization' header available to reuse - no naturally-triggered "
+            "query call was observed during bootstrap, so this request will likely 401.",
+            file=sys.stderr,
+        )
 
     body = build_query_body(
         disease_name, session_info["model_id"], session_info["dataset_id"], report_id
@@ -400,15 +657,12 @@ def fetch_disease_year_state_totals(session_info, disease_name, report_id, max_r
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.post(
-                session_info["query_url"], headers=headers, json=body,
-                timeout=REQUEST_TIMEOUT, impersonate="chrome",
+            text = _frame_fetch(
+                session_info["frame"], session_info["query_url"],
+                method="POST", headers=headers, body=json.dumps(body),
+                compare_to_sample=session_info.get("query_sample"),
             )
-            if not resp.ok:
-                print(f"  [debug] HTTP {resp.status_code} response headers: {dict(resp.headers)}", file=sys.stderr)
-                print(f"  [debug] response body (first 500 chars): {resp.text[:500]}", file=sys.stderr)
-            resp.raise_for_status()
-            data = resp.json()
+            data = json.loads(text)
             dsr = data["results"][0]["result"]["data"]["dsr"]
             return decode_dsr_by_state(dsr)
         except Exception as exc:  # noqa: BLE001 - we want to retry on anything and report it
@@ -546,7 +800,18 @@ def _plot_new_cases_on_ax(ax, results, state, diseases, year=None):
     all_dates = []
     for disease in diseases:
         points = [r for r in chartable if r["disease"] == disease and r["new_cases"] is not None]
-        points.sort(key=lambda r: (r["year"], r["run_date"]))
+        # Sort by run_date alone - NOT (year, run_date). "year" here is which
+        # notification-year bucket a point belongs to, and every run
+        # snapshots every year's running total (so late corrections get
+        # caught), so on the full-history graphs (year=None) sorting by
+        # year-then-date would group all of 2024's points across the WHOLE
+        # run-date range, then all of 2025's points across that same range
+        # again, etc. - a real date x-axis then has to jump forward across
+        # the full range once per year bucket, then jump back to the start
+        # for the next one. Plain run_date order is correct for both the
+        # combined graph and the single-year ones (where there's only one
+        # bucket anyway, so this is equivalent to the old behaviour there).
+        points.sort(key=lambda r: r["run_date"])
         if not points:
             continue
         # Plot the full line through every point, including anomalies, so a
@@ -701,20 +966,34 @@ def main():
     current_year = str(dt.date.today().year)
 
     print("Connecting to NINDSS dashboard...")
-    session_info = bootstrap_session()
-    print(f"  model_id={session_info['model_id']} dataset_id={session_info['dataset_id']}")
-    print(f"  query endpoint={session_info['query_url']}")
+    with sync_playwright() as playwright:
+        session_info = bootstrap_session(playwright)
+        print(f"  model_id={session_info['model_id']} dataset_id={session_info['dataset_id']}")
+        print(f"  query endpoint={session_info['query_url']}")
 
-    all_state_totals = {}  # {disease: {year: {state: total}}}
-    states_seen = set()
-    for label, disease_name in DISEASE_NAMES.items():
-        print(f"Fetching {label} ('{disease_name}')...")
-        year_state_totals = fetch_disease_year_state_totals(session_info, disease_name, REPORT_ID)
-        all_state_totals[label] = year_state_totals
-        for state_totals in year_state_totals.values():
-            states_seen.update(state_totals.keys())
-        national_this_year = sum(year_state_totals.get(current_year, {}).values())
-        print(f"  -> {current_year} national total so far: {national_this_year}")
+        all_state_totals = {}  # {disease: {year: {state: total}}}
+        states_seen = set()
+        try:
+            for label, disease_name in DISEASE_NAMES.items():
+                print(f"Fetching {label} ('{disease_name}')...")
+                year_state_totals = fetch_disease_year_state_totals(session_info, disease_name, REPORT_ID)
+                all_state_totals[label] = year_state_totals
+                for state_totals in year_state_totals.values():
+                    states_seen.update(state_totals.keys())
+                # year_state_totals keys come straight from the JSON response
+                # (ints), while current_year is a string - compare by str()
+                # rather than looking up current_year directly, which would
+                # always silently miss and print a false "0".
+                national_this_year = sum(
+                    sum(state_totals.values())
+                    for year, state_totals in year_state_totals.items()
+                    if str(year) == current_year
+                )
+                print(f"  -> {current_year} national total so far: {national_this_year}")
+        finally:
+            # Close the browser as soon as we're done pulling data - no need
+            # to keep it open through the CSV/plotting steps below.
+            close_session(session_info)
     states = sorted(states_seen)
 
     save_annual_totals_csv(annual_csv, all_state_totals)
@@ -789,6 +1068,12 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # SCHEDULING NOTES
 # ---------------------------------------------------------------------------
+# One-time setup, in addition to `pip install -r requirements.txt`: this
+# script needs a real Chromium binary, not just the playwright pip package.
+#   playwright install chromium
+# (On a fresh Linux machine/CI runner, "playwright install --with-deps chromium"
+# also installs the OS-level libraries Chromium needs.)
+#
 # macOS/Linux (cron), run every Monday at 9am:
 #   0 9 * * 1 /usr/bin/python3 /full/path/to/nindss_tracker.py --data-dir /full/path/to/data --graphs-dir /full/path/to/graphs >> /full/path/to/data/log.txt 2>&1
 #
