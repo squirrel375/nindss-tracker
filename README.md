@@ -20,6 +20,10 @@ Data and CSV history live in [`data/`](./data), charts live in
 | `data/annual_totals.csv` | Full-history annual totals per disease per state (confirmed + probable notifications). Overwritten each run. |
 | `graphs/weekly_new_cases_national.png` | Chart of new notifications since the previous run, per disease, national. |
 | `graphs/weekly_new_cases_by_state.png` | Same, broken out per state/territory. |
+| `graphs/weekly_new_cases_national.html` / `weekly_new_cases_by_state.html` | Interactive versions of the two charts above - hover a point for its exact date and value. Open in a browser (needs internet access once to load Plotly's JS from a CDN). |
+
+Both PNG and HTML versions also come in per-year variants, e.g.
+`weekly_new_cases_national_2026.png` / `.html`.
 
 ### How "new cases this week" is calculated
 

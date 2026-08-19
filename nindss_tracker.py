@@ -61,6 +61,12 @@ OUTPUT FILES:
   - weekly_new_cases_by_state.png   Same, broken out per state/territory.
   - weekly_new_cases_national_<year>.png / _by_state_<year>.png
                                      Same two charts, one pair per calendar year.
+  - weekly_new_cases_national.html / _by_state.html / _national_<year>.html /
+    _by_state_<year>.html           Interactive (Plotly) versions of the
+                                     same charts above - hover a point for
+                                     its exact date and value. Open in a
+                                     browser; loads Plotly's JS from a CDN,
+                                     so needs internet access to render.
 
 CAVEATS
 -------
@@ -123,6 +129,15 @@ DISEASE_COLORS = {
     "RSV": "#2ca02c",
     "Measles": "#9467bd",
 }
+
+# Break a plotted line wherever consecutive points for the same
+# disease/state/year are separated by more than this many days - see
+# _split_into_gap_segments. Deliberately smaller than compute_new_cases's
+# own MAX_GAP_DAYS (which resets new_cases to None, i.e. drops the point
+# entirely, past 45 days): this constant only has to catch smaller-but-
+# still-unusual gaps (a few skipped weeks) that still produce a real
+# new_cases value but would look misleading connected by a straight line.
+GAP_BREAK_DAYS = 21
 
 # Only application-level headers - NOT browser-fingerprint headers
 # (User-Agent, Origin, Referer, Sec-*, Accept-Encoding, etc). Those used to
@@ -832,64 +847,84 @@ def compute_new_cases(snapshot_rows):
 # Step 4: plotting
 # ---------------------------------------------------------------------------
 
+def _weekly_points(results, state, disease, year=None):
+    """Rows for one disease/state (optionally filtered to one notification-
+    year bucket), sorted chronologically by run_date. Shared by both the
+    static (matplotlib) and interactive (plotly) plotting code so they can
+    never disagree on which points to draw or in what order.
+
+    Sorted by run_date alone - NOT (year, run_date). "year" here is which
+    notification-year bucket a point belongs to, and every run snapshots
+    every year's running total (so late corrections get caught), so on the
+    full-history graphs (year=None) sorting year-then-date would group all
+    of 2024's points across the WHOLE run-date range, then all of 2025's
+    points across that same range again, etc. - a real date x-axis then has
+    to jump forward across the full range once per year bucket, then jump
+    back to the start for the next one. Plain run_date order is correct for
+    both the combined graph and the single-year ones (where there's only
+    one bucket anyway, so this is equivalent to sorting by (year, date)
+    there)."""
+    return sorted(
+        (
+            r for r in results
+            if r["state"] == state and r["disease"] == disease
+            and r["new_cases"] is not None
+            and (year is None or r["year"] == year)
+        ),
+        key=lambda r: r["run_date"],
+    )
+
+
+def _split_into_gap_segments(points, max_gap_days=GAP_BREAK_DAYS):
+    """Split chronologically-sorted rows (as returned by _weekly_points)
+    into runs wherever the date gap between consecutive points exceeds
+    max_gap_days - e.g. a year's tracking stopped for months (older
+    versions of this script only recorded the *current* year each week)
+    before multi-year fetching resumed and picked up one genuine but
+    isolated late-arriving point. A straight line across that gap would
+    visually claim a smooth trend that never actually happened, so each
+    gap-separated run gets drawn as its own segment instead - isolated
+    points then show as disconnected markers rather than the ends of a
+    long diagonal line."""
+    segments = [[]]
+    for r in points:
+        date = dt.datetime.strptime(r["run_date"], "%Y-%m-%d")
+        if segments[-1]:
+            prev_date = dt.datetime.strptime(segments[-1][-1]["run_date"], "%Y-%m-%d")
+            if (date - prev_date).days > max_gap_days:
+                segments.append([])
+        segments[-1].append(r)
+    return segments
+
+
 def _plot_new_cases_on_ax(ax, results, state, diseases, year=None):
     """Draw the weekly-new-cases lines for one state onto one axis.
     If year is given (e.g. '2025'), only that calendar year is plotted."""
     import matplotlib.dates as mdates
 
-    chartable = [r for r in results if r["state"] == state and (year is None or r["year"] == year)]
-
     any_plotted = False
     any_anomaly = False
     all_dates = []
     for disease in diseases:
-        points = [r for r in chartable if r["disease"] == disease and r["new_cases"] is not None]
-        # Sort by run_date alone - NOT (year, run_date). "year" here is which
-        # notification-year bucket a point belongs to, and every run
-        # snapshots every year's running total (so late corrections get
-        # caught), so on the full-history graphs (year=None) sorting by
-        # year-then-date would group all of 2024's points across the WHOLE
-        # run-date range, then all of 2025's points across that same range
-        # again, etc. - a real date x-axis then has to jump forward across
-        # the full range once per year bucket, then jump back to the start
-        # for the next one. Plain run_date order is correct for both the
-        # combined graph and the single-year ones (where there's only one
-        # bucket anyway, so this is equivalent to the old behaviour there).
-        points.sort(key=lambda r: r["run_date"])
+        points = _weekly_points(results, state, disease, year=year)
         if not points:
             continue
-        # Plot the full line through every point, including anomalies, so a
-        # genuine reported decrease actually shows as a dip rather than a
-        # gap in the line. Dates are parsed to real datetime objects (not
-        # left as strings) so the x-axis can use a proper monthly tick
-        # locator instead of labeling every single week.
-        xs = [dt.datetime.strptime(r["run_date"], "%Y-%m-%d") for r in points]
-        ys = [r["new_cases"] for r in points]
         color = DISEASE_COLORS.get(disease)
-
-        # Break the line wherever consecutive points are separated by an
-        # unusually long gap - e.g. a year's tracking stopped for months
-        # (older versions of this script only recorded the *current* year
-        # each week) before multi-year fetching resumed and picked up one
-        # genuine but isolated late-arriving point. A straight line across
-        # that gap would visually claim a smooth trend that never actually
-        # happened, so each gap-separated run of points is plotted as its
-        # own segment instead - isolated points then show as disconnected
-        # markers rather than the ends of a long diagonal line.
-        GAP_BREAK_DAYS = 21
-        segments = [[]]
-        for x, y in zip(xs, ys):
-            if segments[-1] and (x - segments[-1][-1][0]).days > GAP_BREAK_DAYS:
-                segments.append([])
-            segments[-1].append((x, y))
-        for seg_i, seg in enumerate(segments):
+        # Dates are parsed to real datetime objects (not left as strings)
+        # so the x-axis can use a proper monthly tick locator instead of
+        # labeling every single week.
+        for seg_i, seg in enumerate(_split_into_gap_segments(points)):
+            xs = [dt.datetime.strptime(r["run_date"], "%Y-%m-%d") for r in seg]
+            ys = [r["new_cases"] for r in seg]
             ax.plot(
-                [p[0] for p in seg], [p[1] for p in seg],
-                marker="o", markersize=3, color=color,
+                xs, ys, marker="o", markersize=3, color=color,
                 label=disease if seg_i == 0 else None,
             )
+            all_dates.extend(xs)
         any_plotted = True
-        all_dates.extend(xs)
+        # Plot anomalies (genuine reported decreases) as a red ring on top
+        # of the existing point, rather than a gap in the line, so the dip
+        # itself still shows.
         anomalies = [r for r in points if r["anomaly"]]
         if anomalies:
             any_anomaly = True
@@ -1006,6 +1041,141 @@ def plot_weekly_new_cases_by_state(results, out_path, states, year=None):
 
 
 # ---------------------------------------------------------------------------
+# Step 4b: interactive (hover-for-date-and-value) HTML versions of the same
+# charts, via Plotly - same data, same colours, same gap-splitting as the
+# static PNGs above (both read through _weekly_points/_split_into_gap_
+# segments), just rendered as self-contained HTML instead of a raster image.
+# ---------------------------------------------------------------------------
+
+ANOMALY_LEGEND_LABEL = "Reported total went down that week (source data, not an error)"
+
+
+def _add_disease_traces_interactive(fig, results, state, diseases, year=None, row=None, col=None, legend_seen=None):
+    """Add one hover-enabled line+marker trace per disease (split into
+    gap-separated segments, matching _plot_new_cases_on_ax) plus a red-ring
+    anomaly overlay, to a plotly figure - optionally at a specific subplot
+    row/col for the by-state grid. legend_seen is a set this mutates so a
+    shared legend across many subplots only gets one entry per disease,
+    not one per subplot."""
+    import plotly.graph_objects as go
+
+    if legend_seen is None:
+        legend_seen = set()
+    add_kwargs = {"row": row, "col": col} if row is not None else {}
+
+    any_plotted = False
+    any_anomaly = False
+    for disease in diseases:
+        points = _weekly_points(results, state, disease, year=year)
+        if not points:
+            continue
+        any_plotted = True
+        color = DISEASE_COLORS.get(disease)
+        for seg in _split_into_gap_segments(points):
+            fig.add_trace(
+                go.Scatter(
+                    x=[r["run_date"] for r in seg],
+                    y=[r["new_cases"] for r in seg],
+                    mode="lines+markers",
+                    name=disease,
+                    legendgroup=disease,
+                    showlegend=disease not in legend_seen,
+                    line=dict(color=color),
+                    marker=dict(color=color, size=6),
+                    hovertemplate=f"%{{x|%d %b %Y}}<br>{disease}: %{{y:,}}<extra></extra>",
+                ),
+                **add_kwargs,
+            )
+            legend_seen.add(disease)
+
+        # Plot anomalies (genuine reported decreases) as a red ring on top
+        # of the existing point, rather than a gap in the line, so the dip
+        # itself still shows. hoverinfo="skip" so hovering there shows just
+        # the one tooltip from the line trace underneath, not two stacked
+        # ones for the same point.
+        anomalies = [r for r in points if r["anomaly"]]
+        if anomalies:
+            any_anomaly = True
+            fig.add_trace(
+                go.Scatter(
+                    x=[r["run_date"] for r in anomalies],
+                    y=[r["new_cases"] for r in anomalies],
+                    mode="markers",
+                    marker=dict(size=12, color="rgba(0,0,0,0)", line=dict(color="red", width=1.8)),
+                    name=ANOMALY_LEGEND_LABEL,
+                    legendgroup="anomaly",
+                    showlegend="anomaly" not in legend_seen,
+                    hoverinfo="skip",
+                ),
+                **add_kwargs,
+            )
+            legend_seen.add("anomaly")
+    return any_plotted, any_anomaly
+
+
+def plot_weekly_new_cases_interactive(results, out_path, state="National", year=None):
+    """Interactive HTML version of plot_weekly_new_cases - hover a point
+    for its exact date and value. If year is given, only that calendar
+    year is shown."""
+    import plotly.graph_objects as go
+
+    diseases = sorted(set(r["disease"] for r in results if r["state"] == state))
+    fig = go.Figure()
+    any_plotted, _ = _add_disease_traces_interactive(fig, results, state, diseases, year=year)
+
+    title_suffix = f" - {year}" if year else ""
+    title = f"Weekly new case numbers - {state} (confirmed + probable){title_suffix}"
+    if any_plotted:
+        fig.update_layout(
+            title=title,
+            xaxis_title="Date",
+            yaxis_title="New notifications since previous run",
+            hovermode="closest",
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
+            margin=dict(b=100),
+        )
+    else:
+        fig.update_layout(
+            title=title,
+            template="plotly_white",
+            annotations=[dict(
+                text="Not enough history yet", showarrow=False,
+                xref="paper", yref="paper", x=0.5, y=0.5,
+            )],
+        )
+    fig.write_html(out_path, include_plotlyjs="cdn")
+
+
+def plot_weekly_new_cases_by_state_interactive(results, out_path, states, year=None):
+    """Interactive HTML grid version of plot_weekly_new_cases_by_state -
+    one hover-enabled subplot per state. If year is given, only that
+    calendar year is shown."""
+    from plotly.subplots import make_subplots
+
+    diseases = sorted(set(r["disease"] for r in results if r["state"] != "National"))
+    ncols = 4
+    nrows = (len(states) + ncols - 1) // ncols
+    fig = make_subplots(rows=nrows, cols=ncols, subplot_titles=states)
+
+    legend_seen = set()
+    for i, state in enumerate(states):
+        row, col = i // ncols + 1, i % ncols + 1
+        _add_disease_traces_interactive(
+            fig, results, state, diseases, year=year, row=row, col=col, legend_seen=legend_seen,
+        )
+
+    title_suffix = f" - {year}" if year else ""
+    fig.update_layout(
+        title=f"Weekly new case numbers by state/territory{title_suffix}",
+        template="plotly_white",
+        height=280 * nrows,
+        legend=dict(orientation="h", yanchor="top", y=-0.06, xanchor="center", x=0.5),
+    )
+    fig.write_html(out_path, include_plotlyjs="cdn")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1027,6 +1197,8 @@ def main():
     weekly_csv = os.path.join(args.data_dir, "weekly_snapshots.csv")
     weekly_national_png = os.path.join(args.graphs_dir, "weekly_new_cases_national.png")
     weekly_by_state_png = os.path.join(args.graphs_dir, "weekly_new_cases_by_state.png")
+    weekly_national_html = os.path.join(args.graphs_dir, "weekly_new_cases_national.html")
+    weekly_by_state_html = os.path.join(args.graphs_dir, "weekly_new_cases_by_state.html")
 
     run_date = dt.date.today().isoformat()
     current_year = str(dt.date.today().year)
@@ -1107,19 +1279,26 @@ def main():
 
     plot_weekly_new_cases(results, weekly_national_png, state="National")
     plot_weekly_new_cases_by_state(results, weekly_by_state_png, states)
+    plot_weekly_new_cases_interactive(results, weekly_national_html, state="National")
+    plot_weekly_new_cases_by_state_interactive(results, weekly_by_state_html, states)
 
     years_present = sorted(set(r["year"] for r in results if r["new_cases"] is not None))
     year_files = []
     for year in years_present:
         national_year_png = os.path.join(args.graphs_dir, f"weekly_new_cases_national_{year}.png")
         by_state_year_png = os.path.join(args.graphs_dir, f"weekly_new_cases_by_state_{year}.png")
+        national_year_html = os.path.join(args.graphs_dir, f"weekly_new_cases_national_{year}.html")
+        by_state_year_html = os.path.join(args.graphs_dir, f"weekly_new_cases_by_state_{year}.html")
         plot_weekly_new_cases(results, national_year_png, state="National", year=year)
         plot_weekly_new_cases_by_state(results, by_state_year_png, states, year=year)
-        year_files += [national_year_png, by_state_year_png]
+        plot_weekly_new_cases_interactive(results, national_year_html, state="National", year=year)
+        plot_weekly_new_cases_by_state_interactive(results, by_state_year_html, states, year=year)
+        year_files += [national_year_png, by_state_year_png, national_year_html, by_state_year_html]
 
     print(
         f"\nSaved:\n  {annual_csv}\n  {weekly_csv}\n  {weekly_national_png}\n"
-        f"  {weekly_by_state_png}\n  " + "\n  ".join(year_files)
+        f"  {weekly_by_state_png}\n  {weekly_national_html}\n  {weekly_by_state_html}\n  "
+        + "\n  ".join(year_files)
     )
 
 
