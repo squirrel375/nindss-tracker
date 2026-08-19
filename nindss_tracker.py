@@ -865,16 +865,35 @@ def _weekly_points(results, state, disease, year=None):
     back to the start for the next one. Plain run_date order is correct for
     both the combined graph and the single-year ones (where there's only
     one bucket anyway, so this is equivalent to sorting by (year, date)
-    there)."""
-    return sorted(
-        (
-            r for r in results
-            if r["state"] == state and r["disease"] == disease
-            and r["new_cases"] is not None
-            and (year is None or r["year"] == year)
-        ),
-        key=lambda r: r["run_date"],
-    )
+    there).
+
+    For the combined graph (year=None) specifically, also drop any row
+    whose notification-year bucket ISN'T the calendar year the run itself
+    happened in. Without this, every run's near-always-zero "late
+    correction" delta for every OTHER tracked year lands on the exact same
+    x-position as that week's real current-year delta - confirmed via a
+    simulated run: 36 separate points (35 of them 0) plotted on a single
+    date for one disease, once enough years are being tracked in parallel
+    (which is already true today, not just after a year rollover). Drawn
+    as one line, that's a vertical spike every single week. Restricting to
+    the "current year at the time" bucket makes the combined graph behave
+    exactly like each year's own graph stitched end-to-end at each Jan 1
+    rollover, which is what "full history" is actually meant to show -
+    the operational week-to-week trend, not every correction to every
+    year all mashed onto one line. (Per-year graphs are unaffected - they
+    already filter to one bucket, so there's nothing to collide with.)"""
+    points = [
+        r for r in results
+        if r["state"] == state and r["disease"] == disease
+        and r["new_cases"] is not None
+        and (year is None or r["year"] == year)
+    ]
+    if year is None:
+        points = [
+            r for r in points
+            if r["year"] == str(dt.datetime.strptime(r["run_date"], "%Y-%m-%d").year)
+        ]
+    return sorted(points, key=lambda r: r["run_date"])
 
 
 def _split_into_gap_segments(points, max_gap_days=GAP_BREAK_DAYS):
@@ -1234,6 +1253,24 @@ def main():
             # Close the browser as soon as we're done pulling data - no need
             # to keep it open through the CSV/plotting steps below.
             close_session(session_info)
+
+    if not states_seen:
+        # fetch_disease_year_state_totals already raises on an outright HTTP
+        # failure - this is the OTHER failure mode: a technically-successful
+        # (200 OK) response that just has no rows for any disease, e.g. a
+        # DISEASE_NAMES filter silently matching nothing after the dashboard
+        # renames a disease. Left unguarded, this crashes deep inside
+        # matplotlib ("Number of rows must be a positive integer, not 0")
+        # with no indication of the real cause - raise something actionable
+        # instead, matching how every other dashboard-shape failure in this
+        # script is handled.
+        raise RuntimeError(
+            "The dashboard returned no per-state data for any disease this "
+            "run (zero states seen across all of DISEASE_NAMES) - the "
+            "query itself didn't fail, but came back empty. This usually "
+            "means a DISEASE_NAMES value no longer matches the dashboard's "
+            "own filter values. See CAVEATS in this script."
+        )
     states = sorted(states_seen)
 
     save_annual_totals_csv(annual_csv, all_state_totals)
