@@ -737,26 +737,63 @@ def save_annual_totals_csv(path, all_state_totals):
                     writer.writerow([disease, state, year, state_totals[state]])
 
 
-def append_weekly_snapshot(path, run_date, all_state_totals):
+def append_weekly_snapshot(path, run_date, all_state_totals, current_year):
     """
     all_state_totals: {disease: {year: {state: total}}}
-    Appends one row per disease PER YEAR PER STATE (not just the current
-    year, and not just the national total) - plus a synthetic
-    state="National" row summing all states. Snapshotting every year every
-    week means each year's series is self-contained (never compared against
-    a different year's total at a year rollover) and still catches late-
-    reported/backdated corrections that show up weeks after the fact.
+    Appends one row per disease/state/year (plus a synthetic
+    state="National" row summing all states), but only when it's actually
+    worth recording:
+      - the CURRENT calendar year is written unconditionally, every run -
+        that's the "live" series people actually watch week to week, and
+        both the console "New cases since last run" summary and
+        compute_new_cases's own gap detection depend on it having a row
+        roughly every 7 days.
+      - any OTHER (already-completed) year is only written when its
+        cumulative total actually changed since the last row recorded for
+        that exact disease/state/year - i.e. a genuine late-reported
+        correction landed. Skipping unchanged old-year rows is what stops
+        this file growing by roughly (diseases x states x tracked-years)
+        rows on EVERY single run forever, almost all of them just
+        restating a number that hasn't moved - confirmed via a live run:
+        one run wrote ~1300 such rows for years back to 1991, the huge
+        majority completely unchanged from the week before.
+    Snapshotting every year (rather than only the current one) is still
+    what makes each year's series self-contained - never compared against
+    a different year's total at a rollover - and what catches late-
+    reported/backdated corrections at all; this just stops re-recording
+    the ones that didn't change.
     """
     file_exists = os.path.exists(path)
+
+    # The last cumulative value already on file for every (disease, state,
+    # year), so an unchanged past-year row can be skipped. The file is
+    # always appended to in run_date order, so a single forward pass -
+    # letting a later row for the same key overwrite an earlier one -
+    # lands on the most recent value for free.
+    last_known = {}
+    if file_exists:
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                last_known[(row["disease"], row["state"], row["year"])] = int(row["cumulative_notifications"])
+
+    def should_write(disease, state, year, cumulative):
+        if str(year) == str(current_year):
+            return True
+        key = (disease, state, str(year))
+        return last_known.get(key) != cumulative
+
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(["run_date", "disease", "state", "year", "cumulative_notifications"])
         for disease, year_state_totals in all_state_totals.items():
             for year, state_totals in sorted(year_state_totals.items()):
-                writer.writerow([run_date, disease, "National", year, sum(state_totals.values())])
+                national_total = sum(state_totals.values())
+                if should_write(disease, "National", year, national_total):
+                    writer.writerow([run_date, disease, "National", year, national_total])
                 for state, cumulative in sorted(state_totals.items()):
-                    writer.writerow([run_date, disease, state, year, cumulative])
+                    if should_write(disease, state, year, cumulative):
+                        writer.writerow([run_date, disease, state, year, cumulative])
 
 
 def compute_new_cases(snapshot_rows):
@@ -776,11 +813,35 @@ def compute_new_cases(snapshot_rows):
     anomalies rather than silently reported as a negative "new case" count.
 
     Also new_cases=None (a reset, same as a first sighting) whenever the gap
-    since that year's previous snapshot exceeds MAX_GAP_DAYS - a multi-month
-    gap means that year genuinely wasn't tracked at all for a while, not
-    "you missed a week or two," and reporting however much it grew over the
-    whole gap as a single week's "new cases" would be fabricating a number,
-    not just reporting a slightly-longer-than-usual one.
+    since that key's previous snapshot exceeds MAX_GAP_DAYS - e.g. an older
+    version of this script only ever recorded the *current* year each week,
+    so an older year's tracking silently stopped the moment the year rolled
+    over, until multi-year fetching resumed much later. Reporting however
+    much a value grew over a gap like that as a single week's "new cases"
+    would be fabricating a number, not just reporting a slightly-longer-
+    than-usual one.
+
+    MAX_GAP_DAYS is deliberately generous (120 days, not e.g. 45) because
+    append_weekly_snapshot only writes a row for an already-completed year
+    when its value actually changed - so a quiet past year can legitimately
+    go a couple of months between real rows even though the script itself
+    never stopped running. A tempting fix would be to instead check "did
+    the script run continuously" via run_dates from OTHER keys (the current
+    year is always written) rather than this key's own gap - but that
+    doesn't work: it can't distinguish "this key was checked every week and
+    genuinely didn't change" from "this key was never even checked" (true
+    of every pre-multi-year-fetch historical row), because both look
+    identical - some row exists for some other key on every date either
+    way. Confirmed by testing: that approach failed to reset the real,
+    known ~600-day 2024 tracking gap, silently resurrecting the exact
+    fabricated-delta bug this was meant to prevent. A single conservative
+    per-key threshold is less clever but doesn't have that failure mode -
+    the accepted trade-off is that a correction to a VERY quiet
+    disease/state/year arriving more than 120 days after the last one
+    occasionally shows as a reset instead of a delta. Nothing is lost
+    silently: the cumulative total is still recorded correctly as the new
+    baseline for the next comparison, it just doesn't get reported as a
+    "revised" figure that one time.
 
     Rows from before the 'state' column existed are treated as state="National"
     for backwards compatibility with older weekly_snapshots.csv files.
@@ -791,18 +852,7 @@ def compute_new_cases(snapshot_rows):
         key = (row["disease"], state)
         by_group.setdefault(key, []).append(row)
 
-    # Beyond this, a gap between consecutive snapshots for the same
-    # disease+state+year isn't "you skipped a week or two" (the CAVEATS at
-    # the top of this file already account for that - the delta just covers
-    # a longer period, which is fine) - it's evidence that year simply
-    # wasn't being tracked at all for a long stretch (e.g. an older version
-    # of this script only ever recorded the *current* year each week, so an
-    # older year's tracking silently stopped the moment the year rolled
-    # over, until multi-year fetching resumed much later). Treat that like
-    # a fresh first sighting (new_cases=None) rather than reporting however
-    # many months of accumulated growth happened to fall between the two
-    # snapshots as if it were one week's worth of new cases.
-    MAX_GAP_DAYS = 45
+    MAX_GAP_DAYS = 120
 
     results = []
     for (disease, state), rows in by_group.items():
@@ -1274,7 +1324,7 @@ def main():
     states = sorted(states_seen)
 
     save_annual_totals_csv(annual_csv, all_state_totals)
-    append_weekly_snapshot(weekly_csv, run_date, all_state_totals)
+    append_weekly_snapshot(weekly_csv, run_date, all_state_totals, current_year)
 
     snapshot_rows = load_weekly_snapshots(weekly_csv)
     results = compute_new_cases(snapshot_rows)

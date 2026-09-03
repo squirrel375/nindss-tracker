@@ -16,7 +16,7 @@ Data and CSV history live in [`data/`](./data), charts live in
 
 | File | What it is |
 |---|---|
-| `data/weekly_snapshots.csv` | One row per disease per state per run: the run date and that year's cumulative notification count at the time. This is the source of truth for "new cases this week" (see below). |
+| `data/weekly_snapshots.csv` | The run date and a year's cumulative notification count per disease/state, as of that run. The current year gets a row every run; past years only get a new row when their number actually changed (see below). This is the source of truth for "new cases this week". |
 | `data/annual_totals.csv` | Full-history annual totals per disease per state (confirmed + probable notifications). Overwritten each run. |
 | `graphs/weekly_new_cases_national.png` | Chart of new notifications since the previous run, per disease, national. |
 | `graphs/weekly_new_cases_by_state.png` | Same, broken out per state/territory. |
@@ -28,20 +28,30 @@ Both PNG and HTML versions also come in per-year variants, e.g.
 ### How "new cases this week" is calculated
 
 The dashboard itself only exposes cumulative annual totals, not a weekly
-breakdown. So each week this tool takes a snapshot of every year's running
-total per disease/state (not just the current year - that also catches
-late-reported/backdated corrections), and the "new cases" number is just
-this week's snapshot minus last week's snapshot for the same disease,
-state, and year. It's exact - not an estimate - as long as the workflow
-runs every week without a gap.
+breakdown. So each week this tool checks every year's running total per
+disease/state (not just the current year - that's what catches
+late-reported/backdated corrections to past years), and the "new cases"
+number is just this week's snapshot minus the last recorded snapshot for
+the same disease, state, and year. It's exact - not an estimate - as long
+as the workflow runs every week without a gap.
+
+The current year gets a row in `weekly_snapshots.csv` every single run,
+since that's the series you actually watch week to week. A past
+(already-completed) year only gets a new row when its number actually
+changed - i.e. a correction landed - otherwise nothing is written for it
+that week. Without this, the file would grow by roughly
+(diseases × states × every tracked year back to 1991) rows on *every*
+run forever, nearly all of them just restating a number that hasn't moved.
 
 If a run is missed, a skipped week or two just means the next delta covers
-a slightly longer period - still a real number. But if a disease/state/year
-combination goes more than 45 days without a snapshot (e.g. the workflow
-breaks for over a month, or - as happened before this tool tracked every
-year each week - a year simply wasn't being checked yet), that gap is
-treated as a fresh start rather than reported as one artificially huge
-"new cases" figure covering the whole gap.
+a slightly longer period - still a real number, and a quiet past year
+naturally going a couple of months between real rows is expected, not a
+problem. But if a disease/state/year combination goes more than 120 days
+without a snapshot (e.g. the workflow breaks for over a month, or - as
+happened before this tool tracked every year each week - a year simply
+wasn't being checked yet), that gap is treated as a fresh start rather than
+reported as one artificially huge "new cases" figure covering the whole
+gap.
 
 Occasionally the source data itself is revised **downward** (health.gov.au
 correcting an earlier count) - these show up as red-ringed points on the
