@@ -51,10 +51,22 @@ notes.
 OUTPUT FILES:
   In --data-dir (default "./data"):
   - annual_totals.csv     Full-history annual totals per disease per state
-                           (overwritten every run - a convenience export).
-  - weekly_snapshots.csv  Cumulative-count snapshot per disease/state/run
-                           (appended every run - this is the source of truth
-                           for the "new cases" numbers).
+                           (overwritten every run - a convenience export,
+                           always reflects the LATEST figures the source
+                           reports, including for past years).
+  - weekly_snapshots.csv  Cumulative-count snapshot per disease/state/run -
+                           this is the source of truth for the "new cases"
+                           numbers, and a point-in-time historical record:
+                           the current year gets a new row every run, but
+                           once a year is no longer current its row is
+                           FROZEN at whatever was last captured and never
+                           rewritten, even if the source later revises that
+                           year's total. See append_weekly_snapshot().
+  - revisions_log.txt     Append-only log of any already-closed year whose
+                           cumulative total the source reported differently
+                           on a later run - i.e. what weekly_snapshots.csv
+                           deliberately does NOT act on, kept here instead
+                           so a revision is still visible somewhere.
 
   In --graphs-dir (default "./graphs"):
   - weekly_new_cases_national.png   Line chart of new cases per week, national.
@@ -87,6 +99,14 @@ CAVEATS
   artificially huge "new cases" figure covering the whole gap.
 - Counts include both "Confirmed" and "Probable" notifications, matching what
   the public dashboard displays.
+- weekly_snapshots.csv intentionally does NOT track the source revising an
+  already-closed year's total after the fact - that year's row is frozen at
+  whatever was captured while it was still current (or on first sighting,
+  for years older than this tool's tracking history). This is deliberate:
+  the file is meant to preserve what was reported at the time, not to keep
+  silently rewriting history. annual_totals.csv, by contrast, always shows
+  the latest figures, and revisions_log.txt records any changes that
+  weekly_snapshots.csv itself didn't act on.
 """
 
 import argparse
@@ -737,50 +757,66 @@ def save_annual_totals_csv(path, all_state_totals):
                     writer.writerow([disease, state, year, state_totals[state]])
 
 
-def append_weekly_snapshot(path, run_date, all_state_totals, current_year):
+def append_weekly_snapshot(path, run_date, all_state_totals, current_year, revisions_log_path=None):
     """
     all_state_totals: {disease: {year: {state: total}}}
     Appends one row per disease/state/year (plus a synthetic
-    state="National" row summing all states), but only when it's actually
-    worth recording:
+    state="National" row summing all states), but past years are
+    deliberately FROZEN once captured - this file is meant to record what
+    was reported at the time, not to keep chasing every later revision
+    health.gov.au makes to an old figure:
       - the CURRENT calendar year is written unconditionally, every run -
         that's the "live" series people actually watch week to week, and
         both the console "New cases since last run" summary and
         compute_new_cases's own gap detection depend on it having a row
         roughly every 7 days.
-      - any OTHER (already-completed) year is only written when its
-        cumulative total actually changed since the last row recorded for
-        that exact disease/state/year - i.e. a genuine late-reported
-        correction landed. Skipping unchanged old-year rows is what stops
-        this file growing by roughly (diseases x states x tracked-years)
-        rows on EVERY single run forever, almost all of them just
-        restating a number that hasn't moved - confirmed via a live run:
-        one run wrote ~1300 such rows for years back to 1991, the huge
-        majority completely unchanged from the week before.
-    Snapshotting every year (rather than only the current one) is still
-    what makes each year's series self-contained - never compared against
-    a different year's total at a rollover - and what catches late-
-    reported/backdated corrections at all; this just stops re-recording
-    the ones that didn't change.
+      - any OTHER (already-completed) year is written ONLY the first time
+        we ever see that exact disease/state/year - either the last row it
+        got while it was still the current year (rolling over naturally),
+        or, for years that predate this tool tracking them at all, the
+        first value observed on whatever run first fetched that far back.
+        Once that row exists, it is never added to or replaced again, no
+        matter how many times the source's cumulative total for that
+        year subsequently changes. This is a deliberate policy change
+        (this script used to re-write a past year's row whenever its
+        total changed, to catch late-reported corrections - see git
+        history) - that meant "past" data kept quietly mutating for
+        years in the underlying CSV, which defeats the point of a
+        point-in-time historical record. If you want revision history,
+        that's what revisions_log_path is for (see below), not this file.
+    If a past year's cumulative total HAS changed since the row already on
+    file, that's logged (one line per changed disease/state/year) to
+    revisions_log_path when given, rather than silently dropped - so
+    there's still a record that a revision happened and by how much, it
+    just doesn't touch weekly_snapshots.csv itself. Returns the list of
+    (disease, state, year, old_value, new_value) tuples that were logged
+    this run, so the caller can also surface them on stdout.
     """
     file_exists = os.path.exists(path)
 
     # The last cumulative value already on file for every (disease, state,
-    # year), so an unchanged past-year row can be skipped. The file is
-    # always appended to in run_date order, so a single forward pass -
-    # letting a later row for the same key overwrite an earlier one -
-    # lands on the most recent value for free.
+    # year) - both to decide whether a past year has already been captured
+    # at all, and, if so, to detect (and log) a later revision without
+    # acting on it. The file is always appended to in run_date order, so a
+    # single forward pass - letting a later row for the same key overwrite
+    # an earlier one - lands on the most recently recorded value for free.
     last_known = {}
     if file_exists:
         with open(path, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 last_known[(row["disease"], row["state"], row["year"])] = int(row["cumulative_notifications"])
 
+    revised = []  # (disease, state, year, old_value, new_value)
+
     def should_write(disease, state, year, cumulative):
         if str(year) == str(current_year):
             return True
         key = (disease, state, str(year))
-        return last_known.get(key) != cumulative
+        if key not in last_known:
+            return True
+        if last_known[key] != cumulative:
+            revised.append((disease, state, str(year), last_known[key], cumulative))
+        return False
 
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -794,6 +830,17 @@ def append_weekly_snapshot(path, run_date, all_state_totals, current_year):
                 for state, cumulative in sorted(state_totals.items()):
                     if should_write(disease, state, year, cumulative):
                         writer.writerow([run_date, disease, state, year, cumulative])
+
+    if revised and revisions_log_path:
+        with open(revisions_log_path, "a", encoding="utf-8") as f:
+            for disease, state, year, old, new in revised:
+                f.write(
+                    f"{run_date}: {disease} / {state} {year} cumulative total reported by the "
+                    f"source changed from {old} to {new} - weekly_snapshots.csv left unchanged "
+                    f"(that year is already closed and frozen)\n"
+                )
+
+    return revised
 
 
 def compute_new_cases(snapshot_rows):
@@ -811,6 +858,16 @@ def compute_new_cases(snapshot_rows):
     you'd see a negative number is a genuine data correction (health.gov.au
     revising a count downward) within the same year - those are flagged as
     anomalies rather than silently reported as a negative "new case" count.
+
+    Since append_weekly_snapshot() now freezes a year's rows once it's no
+    longer current (see its docstring), a past year will only ever have
+    one row per run_date it was actually captured on - so in practice an
+    "anomaly" here can only be seen for the CURRENT year (a correction
+    landing while that year is still being tracked weekly). Revisions to
+    an already-closed year no longer produce a second row here at all -
+    they're logged separately (see revisions_log_path in
+    append_weekly_snapshot) rather than being reflected in this file or
+    these results.
 
     Also new_cases=None (a reset, same as a first sighting) whenever the gap
     since that key's previous snapshot exceeds MAX_GAP_DAYS - e.g. an older
@@ -906,12 +963,14 @@ def _weekly_points(results, state, disease, year=None):
     never disagree on which points to draw or in what order.
 
     Sorted by run_date alone - NOT (year, run_date). "year" here is which
-    notification-year bucket a point belongs to, and every run snapshots
-    every year's running total (so late corrections get caught), so on the
-    full-history graphs (year=None) sorting year-then-date would group all
-    of 2024's points across the WHOLE run-date range, then all of 2025's
-    points across that same range again, etc. - a real date x-axis then has
-    to jump forward across the full range once per year bucket, then jump
+    notification-year bucket a point belongs to, and a full-history query
+    is still run for every tracked year on every run (so a year that's
+    still current gets its usual weekly row, and a not-yet-seen older year
+    can still be captured for the first time) - so on the full-history
+    graphs (year=None) sorting year-then-date would group all of 2024's
+    points across the WHOLE run-date range, then all of 2025's points
+    across that same range again, etc. - a real date x-axis then has to
+    jump forward across the full range once per year bucket, then jump
     back to the start for the next one. Plain run_date order is correct for
     both the combined graph and the single-year ones (where there's only
     one bucket anyway, so this is equivalent to sorting by (year, date)
@@ -919,19 +978,18 @@ def _weekly_points(results, state, disease, year=None):
 
     For the combined graph (year=None) specifically, also drop any row
     whose notification-year bucket ISN'T the calendar year the run itself
-    happened in. Without this, every run's near-always-zero "late
-    correction" delta for every OTHER tracked year lands on the exact same
-    x-position as that week's real current-year delta - confirmed via a
-    simulated run: 36 separate points (35 of them 0) plotted on a single
-    date for one disease, once enough years are being tracked in parallel
-    (which is already true today, not just after a year rollover). Drawn
-    as one line, that's a vertical spike every single week. Restricting to
-    the "current year at the time" bucket makes the combined graph behave
-    exactly like each year's own graph stitched end-to-end at each Jan 1
-    rollover, which is what "full history" is actually meant to show -
-    the operational week-to-week trend, not every correction to every
-    year all mashed onto one line. (Per-year graphs are unaffected - they
-    already filter to one bucket, so there's nothing to collide with.)"""
+    happened in. This mostly matters for older data recorded before
+    append_weekly_snapshot() started freezing past years on first capture
+    (see its docstring) - under the current policy a past year only ever
+    contributes one row total, so it can only collide with a live year's
+    x-position once; this filter is what keeps that one point from
+    appearing as a stray vertical spike off to the side of the real
+    current-year line. Restricting to the "current year at the time"
+    bucket makes the combined graph behave exactly like each year's own
+    graph stitched end-to-end at each Jan 1 rollover, which is what "full
+    history" is actually meant to show - the operational week-to-week
+    trend. (Per-year graphs are unaffected - they already filter to one
+    bucket, so there's nothing to collide with.)"""
     points = [
         r for r in results
         if r["state"] == state and r["disease"] == disease
@@ -1266,6 +1324,7 @@ def main():
     os.makedirs(args.graphs_dir, exist_ok=True)
     annual_csv = os.path.join(args.data_dir, "annual_totals.csv")
     weekly_csv = os.path.join(args.data_dir, "weekly_snapshots.csv")
+    revisions_log = os.path.join(args.data_dir, "revisions_log.txt")
     weekly_national_png = os.path.join(args.graphs_dir, "weekly_new_cases_national.png")
     weekly_by_state_png = os.path.join(args.graphs_dir, "weekly_new_cases_by_state.png")
     weekly_national_html = os.path.join(args.graphs_dir, "weekly_new_cases_national.html")
@@ -1324,7 +1383,7 @@ def main():
     states = sorted(states_seen)
 
     save_annual_totals_csv(annual_csv, all_state_totals)
-    append_weekly_snapshot(weekly_csv, run_date, all_state_totals, current_year)
+    revised = append_weekly_snapshot(weekly_csv, run_date, all_state_totals, current_year, revisions_log_path=revisions_log)
 
     snapshot_rows = load_weekly_snapshots(weekly_csv)
     results = compute_new_cases(snapshot_rows)
@@ -1346,20 +1405,21 @@ def main():
         else:
             print(f"  {label}: {new_cases}")
 
-    # Previous-year totals sometimes creep up after New Year's due to
-    # reporting lag - surface that explicitly rather than letting it hide
-    # silently in the CSV.
-    prev_year = str(int(current_year) - 1)
-    prev_year_updates = [
-        r for r in results
-        if r["run_date"] == run_date and r["year"] == prev_year
-        and r["state"] == "National" and r["new_cases"] not in (None, 0)
-    ]
-    if prev_year_updates:
-        print(f"\n{prev_year} totals were revised since last run (late-reported notifications):")
-        for r in prev_year_updates:
-            direction = "up" if r["new_cases"] > 0 else "down"
-            print(f"  {r['disease']}: {direction} by {abs(r['new_cases'])}")
+    # Past (already-closed) years are frozen in weekly_snapshots.csv (see
+    # append_weekly_snapshot's docstring) - any change the source reports
+    # for one of them doesn't touch that file, but is still surfaced here
+    # and written to revisions_log.txt so it's never silently lost.
+    if revised:
+        print(
+            f"\n{len(revised)} already-closed year figure(s) were revised by the source "
+            f"since they were captured (weekly_snapshots.csv left unchanged - see "
+            f"{revisions_log} for the full record):"
+        )
+        for disease, state, year, old, new in revised[:20]:
+            direction = "up" if new > old else "down"
+            print(f"  {disease} / {state} {year}: {old} -> {new} ({direction} by {abs(new - old)})")
+        if len(revised) > 20:
+            print(f"  ...and {len(revised) - 20} more (see {revisions_log})")
 
     if anomalies_this_run:
         print("\nWARNING: the source data was revised DOWNWARD for these (unusual - worth a look):")
@@ -1384,11 +1444,14 @@ def main():
         plot_weekly_new_cases_by_state_interactive(results, by_state_year_html, states, year=year)
         year_files += [national_year_png, by_state_year_png, national_year_html, by_state_year_html]
 
-    print(
+    saved_line = (
         f"\nSaved:\n  {annual_csv}\n  {weekly_csv}\n  {weekly_national_png}\n"
         f"  {weekly_by_state_png}\n  {weekly_national_html}\n  {weekly_by_state_html}\n  "
         + "\n  ".join(year_files)
     )
+    if revised:
+        saved_line += f"\n  {revisions_log} (updated - {len(revised)} revision(s) logged this run)"
+    print(saved_line)
 
 
 if __name__ == "__main__":

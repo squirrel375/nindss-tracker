@@ -16,8 +16,9 @@ Data and CSV history live in [`data/`](./data), charts live in
 
 | File | What it is |
 |---|---|
-| `data/weekly_snapshots.csv` | The run date and a year's cumulative notification count per disease/state, as of that run. The current year gets a row every run; past years only get a new row when their number actually changed (see below). This is the source of truth for "new cases this week". |
-| `data/annual_totals.csv` | Full-history annual totals per disease per state (confirmed + probable notifications). Overwritten each run. |
+| `data/weekly_snapshots.csv` | The run date and a year's cumulative notification count per disease/state, as of that run. The current year gets a row every run; a past (already-completed) year gets exactly one row, ever, and is then frozen - it is never rewritten, even if the source later revises that year's total (see below). This is the source of truth for "new cases this week", and a point-in-time historical record: what's in here for a given year is what was reported at the time. |
+| `data/annual_totals.csv` | Full-history annual totals per disease per state (confirmed + probable notifications), reflecting the *latest* figures the source reports. Overwritten each run. |
+| `data/revisions_log.txt` | Append-only log of any already-closed year whose total the source reported differently on a later run - i.e. changes that `weekly_snapshots.csv` deliberately does not act on. One line per revision: disease, state, year, old value, new value, and the run date it was noticed. |
 | `graphs/weekly_new_cases_national.png` | Chart of new notifications since the previous run, per disease, national. |
 | `graphs/weekly_new_cases_by_state.png` | Same, broken out per state/territory. |
 | `graphs/weekly_new_cases_national.html` / `weekly_new_cases_by_state.html` | Interactive versions of the two charts above - hover a point for its exact date and value. Open in a browser (needs internet access once to load Plotly's JS from a CDN). |
@@ -29,33 +30,38 @@ Both PNG and HTML versions also come in per-year variants, e.g.
 
 The dashboard itself only exposes cumulative annual totals, not a weekly
 breakdown. So each week this tool checks every year's running total per
-disease/state (not just the current year - that's what catches
-late-reported/backdated corrections to past years), and the "new cases"
-number is just this week's snapshot minus the last recorded snapshot for
-the same disease, state, and year. It's exact - not an estimate - as long
-as the workflow runs every week without a gap.
+disease/state, and the "new cases" number is just this week's snapshot
+minus the last recorded snapshot for the same disease, state, and year.
+It's exact - not an estimate - as long as the workflow runs every week
+without a gap.
 
 The current year gets a row in `weekly_snapshots.csv` every single run,
 since that's the series you actually watch week to week. A past
-(already-completed) year only gets a new row when its number actually
-changed - i.e. a correction landed - otherwise nothing is written for it
-that week. Without this, the file would grow by roughly
-(diseases × states × every tracked year back to 1991) rows on *every*
-run forever, nearly all of them just restating a number that hasn't moved.
+(already-completed) year gets exactly **one** row, ever - either the last
+value it had while it was still the current year, or, for years older
+than this tool's own tracking history, the first value seen the first
+time it was fetched. That row is then frozen: it is never added to or
+replaced again, no matter how many times health.gov.au subsequently
+revises that year's published total. This is deliberate - the point of
+this file is to preserve what was reported *at the time*, not to keep
+quietly rewriting history whenever the source changes its mind about an
+old number. (An earlier version of this tool did rewrite past-year rows
+on every change; that's what `data/revisions_log.txt` now replaces - see
+below.)
 
 If a run is missed, a skipped week or two just means the next delta covers
-a slightly longer period - still a real number, and a quiet past year
-naturally going a couple of months between real rows is expected, not a
-problem. But if a disease/state/year combination goes more than 120 days
-without a snapshot (e.g. the workflow breaks for over a month, or - as
-happened before this tool tracked every year each week - a year simply
-wasn't being checked yet), that gap is treated as a fresh start rather than
-reported as one artificially huge "new cases" figure covering the whole
-gap.
+a slightly longer period - still a real number. But if the current year
+goes more than 120 days without a snapshot (e.g. the workflow breaks for
+over a month), that gap is treated as a fresh start rather than reported
+as one artificially huge "new cases" figure covering the whole gap.
 
-Occasionally the source data itself is revised **downward** (health.gov.au
-correcting an earlier count) - these show up as red-ringed points on the
-charts rather than a negative "new cases" number.
+Occasionally the source data itself is revised **downward** for the
+*current* year (health.gov.au correcting an earlier count) - these show up
+as red-ringed points on that year's chart rather than a negative "new
+cases" number. A revision to an already-**closed** year, by contrast,
+never touches `weekly_snapshots.csv` or the charts at all - it's written
+to `data/revisions_log.txt` instead, and to the always-latest
+`data/annual_totals.csv`.
 
 ## Running it yourself
 
